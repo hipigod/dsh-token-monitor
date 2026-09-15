@@ -1,0 +1,12 @@
+# 本插件自带的 profile 层补丁。
+# 由 package.json 的 dsh.bundle.patch 声明，`dsh plugin --profile web add <本包>` 之后
+# 会自动成为 web profile 的一层（无需手工编辑 profile 的 cordis.patch.yml）。
+#
+# 宿主侧入口：注册两个只读 Web 路由
+#   GET /plugin-api/token-monitor/overview
+#   GET /plugin-api/token-monitor/log
+# 客户端侧入口：package.json 的 dsh.client 声明（platform=web）→ 浏览器 bundle 由
+# client.js 提供，注册进 sidebar.footer.action 槽位。
+- insert:
+    - id: token-monitor
+      name: '@local/dsh-token-monitor'

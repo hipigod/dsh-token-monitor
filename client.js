@@ -1,0 +1,1132 @@
+/**
+ * 模型 Token 用量监测 · TOKEN MONITOR — Client half.
+ *
+ * 挂载点：侧边栏底部、设置按钮上方（`sidebar.footer.action`，list 槽位，与 ui-settings
+ * 的 `sidebar.settings` 相邻，由 ui-sidebar 的 SidebarRoot 按「footerActions 在 settingsArea
+ * 之上」渲染，因此本组件天然位于设置按钮上方）。
+ *
+ * 数据来源：宿主侧插件注册的两个命名路由
+ *   GET /plugin-api/token-monitor/overview   今日总览（小窗口）
+ *   GET /plugin-api/token-monitor/log?...    日志弹窗全量报告
+ * 客户端不读会话日志、不碰 ctx 服务之外的东西，只做取数与呈现。
+ *
+ * 展示约定：
+ *   - 「输入（命中缓存）」= cacheReadTokens
+ *   - 「输入（未命中缓存）」= inputTokens + cacheWriteTokens
+ *   - 「输出」= outputTokens（含 reasoning）
+ *   - 时间口径固定 Asia/Shanghai，由宿主统一切分，客户端不再做时区换算。
+ */
+window.__ModuleLoader__.load({
+  id: "@local/dsh-token-monitor",
+  factory: (require) => {
+    var module = { exports: {} }
+    var exports = module.exports
+    Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
+
+    var React = require('react')
+    var jsx = require('react/jsx-runtime')
+    var primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+    var Modal = primitives.Modal
+    var IconRefreshOutline14 = primitives.IconRefreshOutline14
+    var IconDataOutline16 = primitives.IconDataOutline16
+    var IconCloseOutline16 = primitives.IconCloseOutline16
+
+    // ───────────────────────── 常量 ─────────────────────────
+
+    var API_OVERVIEW = '/plugin-api/token-monitor/overview'
+    var API_LOG = '/plugin-api/token-monitor/log'
+    /** 小窗口自动刷新间隔（宿主侧扫描有 (mtime,size) 缓存，这个频率不会造成重复解码）。 */
+    var POLL_MS = 30000
+    /** 分页大小。 */
+    var PAGE_SIZE = 12
+
+    // 全部用 DeepSeek 自己的蓝色系（--dsw-static-deepseek-*），三桶靠明度而不是色相区分：
+    //   命中缓存 400（中亮）→ 未命中 500（标准 DeepSeek 蓝）→ 输出 450（高亮）
+    // 明度顺序也表达语义：缓存命中是"省下来的"（偏浅），输出是"真金白银花出去的"（最亮）。
+    var COLORS = {
+      cacheRead: 'var(--dsw-static-deepseek-400)',
+      uncached: 'var(--dsw-static-deepseek-500)',
+      output: 'var(--dsw-static-deepseek-450)',
+      // 峰谷时段带：高峰=标准 DeepSeek 蓝（贵），空闲=浅蓝（便宜一半）。
+      // 用同一色系的明度差，而不是红/绿那种"好坏"语义——峰谷只是价格差异，不是对错。
+      peakBand: 'var(--dsw-static-deepseek-500)',
+      idleBand: 'var(--dsw-static-deepseek-200)',
+      /** 花费/余额：中性强调色，避免和 token 三桶抢注意力。 */
+      money: 'var(--dsw-alias-label-primary)',
+    }
+
+    // ───────────────────────── 样式 ─────────────────────────
+
+    var CSS_TAG = 'dsh-token-monitor/skin.css'
+    var CSS = [
+      '.tm-root{box-sizing:border-box;display:flex;flex-direction:column;gap:6px;padding:8px 10px 10px;margin:0 6px 2px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);font:var(--dsw-font-xs-12,12px/1.5 ui-sans-serif,system-ui,"PingFang SC","Microsoft YaHei",sans-serif);color:var(--dsw-alias-label-primary)}',
+      '.tm-root *{box-sizing:border-box}',
+      '.tm-root-tight{padding:6px 4px;margin:0 4px 2px;align-items:center}',
+
+      '.tm-head{display:flex;align-items:center;gap:6px;min-width:0}',
+      '.tm-title{display:flex;align-items:center;gap:5px;flex:1 1 auto;min-width:0;overflow:hidden}',
+      // max-width 是必需的：flex 子项不会自动收缩到可用宽度，只写 ellipsis 会让长模型名
+      // 直接压到【日志】按钮上（截图实证）。这里显式留出按钮宽度。
+      // 名字可用宽度跟容器走：固定 96px 会把它压成 "deepseek-fl…"，而【日志】左边其实还有空白。
+      // clamp 给 96px 保底（防重叠）+ 42% 弹性 + 190px 上限（超长名不挤压按钮）。
+      '.tm-model{display:block;flex:0 1 auto;min-width:0;max-width:clamp(96px,42%,190px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:650;font-size:12px;color:var(--dsw-alias-label-primary)}',
+      '.tm-model-dim{color:var(--dsw-alias-label-tertiary);font-weight:500}',
+      '.tm-head-actions{display:flex;align-items:center;gap:2px;flex:none}',
+
+      '.tm-total{display:flex;align-items:baseline;gap:5px;flex-wrap:wrap}',
+      '.tm-total-value{font-size:17px;font-weight:700;letter-spacing:-.01em;font-variant-numeric:tabular-nums}',
+      '.tm-total-label{font-size:11px;color:var(--dsw-alias-label-tertiary)}',
+
+      // 花费/余额行
+      '.tm-money{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;padding-top:1px}',
+      '.tm-money-item{display:flex;align-items:baseline;gap:3px;min-width:0}',
+      '.tm-money-value{font-size:12.5px;font-weight:650;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary)}',
+      '.tm-money-label{font-size:10.5px;color:var(--dsw-alias-label-tertiary)}',
+      '.tm-money-dim{color:var(--dsw-alias-label-tertiary);font-weight:500}',
+      '.tm-money-warn{color:var(--dsw-alias-state-warn-label)}',
+
+      // 峰谷时段带（直方图上方）
+      '.tm-band{display:flex;gap:1px;height:5px;margin-bottom:3px}',
+      '.tm-band-cell{flex:1 1 0;min-width:2px;border-radius:1px;background:var(--dsw-alias-bg-layer-2)}',
+      '.tm-band-cell[data-band="1"]{background:var(--dsw-static-deepseek-200)}',
+      '.tm-band-cell[data-band="2"]{background:var(--dsw-static-deepseek-500)}',
+      '.tm-band-legend{display:flex;align-items:center;gap:8px;font-size:10px;color:var(--dsw-alias-label-tertiary);margin-bottom:2px}',
+      '.tm-band-key{display:flex;align-items:center;gap:3px}',
+
+      '.tm-chart{display:flex;align-items:flex-end;gap:1px;height:42px;padding-top:2px}',
+      '.tm-bar{flex:1 1 0;min-width:2px;height:100%;display:flex;flex-direction:column;justify-content:flex-end;gap:0;border-radius:2px;cursor:default;background:var(--dsw-alias-bg-layer-2);overflow:hidden}',
+      '.tm-bar-on{outline:1px solid var(--dsw-alias-border-l3);outline-offset:0}',
+      '.tm-bar span{display:block;width:100%}',
+      '.tm-bar-empty{height:2px;background:var(--dsw-alias-border-l1)}',
+
+      '.tm-axis{display:flex;justify-content:space-between;font-size:10px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
+      '.tm-legend{display:flex;gap:8px 10px;flex-wrap:wrap;justify-content:flex-end;max-width:100%;min-width:0;font-size:10.5px;color:var(--dsw-alias-label-secondary)}',
+      '.tm-legend-item{display:flex;align-items:center;gap:4px;cursor:default}',
+      '.tm-legend-item b{font-weight:600;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}',
+      '.tm-swatch{width:8px;height:8px;border-radius:2px;flex:none}',
+      '.tm-hint{min-height:14px;font-size:10.5px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.tm-note{font-size:10.5px;color:var(--dsw-alias-label-tertiary)}',
+      '.tm-error{font-size:10.5px;color:var(--dsw-alias-state-error-primary)}',
+
+      // 窄栏（collapsed：56px rail）形态
+      '.tm-rail{display:flex;flex-direction:column;align-items:center;gap:2px;width:100%;background:none;border:none;padding:4px 0;border-radius:8px;color:var(--dsw-alias-label-secondary);cursor:pointer;font:inherit}',
+      '.tm-rail:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.tm-rail-value{font-size:9.5px;font-weight:650;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;line-height:1}',
+
+      // 纯文字按钮（本插件自带，避免依赖其它插件组件）
+      '.tm-btn{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);border-radius:6px;padding:2px 7px;font:inherit;font-size:11px;line-height:1.5;cursor:pointer;white-space:nowrap}',
+      '.tm-btn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.tm-btn[aria-pressed="true"]{background:var(--dsw-alias-interactive-bg-active);border-color:var(--dsw-alias-border-l3);color:var(--dsw-alias-label-primary);font-weight:650}',
+      '.tm-btn-icon{display:inline-flex;align-items:center;justify-content:center;padding:3px}',
+      '.tm-btn[disabled]{opacity:.5;cursor:default}',
+
+      // 弹窗
+      // ① 卡片本身：ui-primitives 的 .dialog 是 width:min(380px,100%) + overflow:hidden，
+      //    内层再宽也会被裁掉（实测：内层 1080px、卡片 380px → 右侧全被隐藏）。
+      //    Modal 只把 className 透给卡片，所以宽度必须在这里覆盖。
+      // 宽度：Modal 的 .root 自带 24px 内边距，所以可用宽度 = 100vw - 48px；
+      // 直接用 94vw 在窄视口会超出这个可用宽度被裁。min-width:0 是必需的——
+      // 卡片是 flex item，默认 min-width:auto 不会收缩到可用宽度以下。
+      '.tm-modal{width:min(1080px,calc(100vw - 48px)) !important;min-width:0 !important;max-width:none !important;max-height:calc(100vh - 48px) !important;overflow:hidden}',
+      // ② 内层：只负责排版与滚动，宽度交给卡片
+      '.tm-dialog{box-sizing:border-box;display:flex;flex-direction:column;gap:12px;width:100%;min-width:0;max-width:none;flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;padding:18px 22px 20px}',
+      '.tm-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:2px 0 0}',
+      '.tm-dialog-title{margin:0;font-size:16px;line-height:24px;font-weight:500;color:var(--dsw-alias-label-primary)}',
+      '.tm-dialog-desc{margin:3px 0 0;font-size:11.5px;color:var(--dsw-alias-label-tertiary)}',
+      '.tm-dialog-close{flex:none;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:none;border-radius:8px;background:transparent;cursor:pointer;color:var(--dsw-alias-label-secondary)}',
+      '.tm-dialog-close:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.tm-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+      '.tm-row-between{justify-content:space-between}',
+      '.tm-sep{width:1px;height:16px;background:var(--dsw-alias-border-l1)}',
+      '.tm-group{display:flex;gap:4px;flex-wrap:wrap}',
+      '.tm-date{background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;color:var(--dsw-alias-label-primary);font:inherit;font-size:11.5px;padding:2px 6px;color-scheme:dark}',
+      '.tm-range-text{font-size:11.5px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
+
+      '.tm-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:8px}',
+      '.tm-card{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:8px 10px;background:var(--dsw-alias-bg-layer-1)}',
+      '.tm-card-label{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--dsw-alias-label-tertiary);margin-bottom:3px}',
+      '.tm-card-value{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.01em}',
+      '.tm-card-sub{font-size:10.5px;color:var(--dsw-alias-label-tertiary);margin-top:2px}',
+
+      '.tm-section{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);padding:10px}',
+      '.tm-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px 12px;flex-wrap:wrap;margin-bottom:8px}',
+      '.tm-section-title{font-size:12.5px;font-weight:650}',
+      '.tm-section-sub{font-size:11px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
+
+      '.tm-hist{display:flex;align-items:flex-end;gap:2px;height:96px;padding-top:4px;overflow-x:auto}',
+      '.tm-hist-col{flex:1 1 0;min-width:7px;height:100%;display:flex;flex-direction:column;justify-content:flex-end;gap:0;border-radius:3px;background:var(--dsw-alias-bg-layer-2);cursor:default}',
+      '.tm-hist-col-on{outline:1px solid var(--dsw-alias-border-l3)}',
+      '.tm-hist-col span{display:block;width:100%}',
+      '.tm-hist-axis{display:flex;gap:2px;margin-top:5px;font-size:10px;color:var(--dsw-alias-label-tertiary)}',
+      '.tm-hist-axis div{flex:1 1 0;min-width:7px;text-align:center;overflow:hidden;white-space:nowrap}',
+
+      '.tm-dist{display:flex;flex-direction:column;gap:6px;margin-top:2px}',
+      '.tm-dist-row{display:flex;align-items:center;gap:8px;font-size:11.5px}',
+      '.tm-dist-name{flex:0 0 auto;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}',
+      '.tm-dist-track{flex:1 1 auto;height:8px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);overflow:hidden;display:flex}',
+      '.tm-dist-track span{display:block;height:100%}',
+      '.tm-dist-value{flex:0 0 auto;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary);font-weight:600}',
+      '.tm-dist-pct{flex:0 0 42px;text-align:right;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-tertiary);font-size:10.5px}',
+
+      '.tm-table-wrap{width:100%;max-width:100%;overflow-x:auto;overflow-y:visible}',
+      '.tm-table{width:100%;border-collapse:collapse;font-size:11.5px}',
+      '.tm-table th{text-align:right;font-weight:500;color:var(--dsw-alias-label-tertiary);font-size:10.5px;padding:0 8px 6px;white-space:nowrap;border-bottom:1px solid var(--dsw-alias-border-l1)}',
+      '.tm-table th:first-child,.tm-table td:first-child{text-align:left}',
+      '.tm-table td{padding:6px 8px;border-bottom:1px solid var(--dsw-alias-border-l1);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}',
+      '.tm-cell-title{max-width:min(420px,42vw)}',
+      '.tm-table tr:last-child td{border-bottom:none}',
+      '.tm-table tbody tr:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.tm-cell-title{display:flex;flex-direction:column;gap:1px;align-items:flex-start;text-align:left;min-width:180px;max-width:420px}',
+      '.tm-cell-title b{font-weight:600;font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}',
+      '.tm-cell-title small{color:var(--dsw-alias-label-tertiary);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}',
+      '.tm-chip{display:inline-block;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:0 6px;font-size:10px;color:var(--dsw-alias-label-tertiary);margin-right:3px}',
+
+      '.tm-empty{padding:18px 6px;text-align:center;color:var(--dsw-alias-label-tertiary);font-size:11.5px}',
+      '.tm-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10.5px;color:var(--dsw-alias-label-tertiary)}',
+      '.tm-mini{display:inline-flex;gap:2px;align-items:center}',
+    ].join('\n')
+
+    function ensureStyle() {
+      if (typeof document === 'undefined') return
+      if (document.querySelector('style[data-plugin-css="' + CSS_TAG + '"]') !== null) return
+      var tag = document.createElement('style')
+      tag.setAttribute('data-plugin-css', CSS_TAG)
+      tag.textContent = CSS
+      document.head.appendChild(tag)
+    }
+
+    // ───────────────────────── 工具 ─────────────────────────
+
+    /** 紧凑数字：1234 → 1.2k，1200000 → 1.2M。 */
+    function fmtCompact(value) {
+      var n = Number(value) || 0
+      if (n < 1000) return String(n)
+      if (n < 1000000) return trimZero(n / 1000) + 'k'
+      if (n < 1000000000) return trimZero(n / 1000000) + 'M'
+      return trimZero(n / 1000000000) + 'B'
+    }
+
+    function trimZero(n) {
+      var v = n >= 100 ? Math.round(n) : Math.round(n * 10) / 10
+      return String(v)
+    }
+
+    /** 全量数字（千分位），用于明细表。 */
+    function fmtFull(value) {
+      return (Number(value) || 0).toLocaleString('en-US')
+    }
+
+    /** 分档位压缩：把「十万级」显示成 12.3万，避免中文界面里满屏 M。 */
+    function fmtZh(value) {
+      var n = Number(value) || 0
+      if (n < 10000) return fmtFull(n)
+      if (n < 100000000) return trimZero(n / 10000) + '万'
+      return trimZero(n / 100000000) + '亿'
+    }
+
+    /** 金额：小额保留 2~4 位有效数字，别把 ￥0.0034 显示成 ￥0.00。 */
+    function fmtMoney(value, currency) {
+      var n = Number(value)
+      if (!Number.isFinite(n)) return '—'
+      var unit = currency === 'CNY' || currency === undefined || currency === null ? '¥' : (currency + ' ')
+      if (n >= 1) return unit + n.toFixed(2)
+      if (n >= 0.01) return unit + n.toFixed(4)
+      return unit + n.toPrecision(2)
+    }
+
+    function fmtPercent(ratio) {
+      if (ratio === null || ratio === undefined || Number.isNaN(ratio)) return '—'
+      return (ratio * 100).toFixed(1) + '%'
+    }
+
+    /** 桶标签：小时桶 'YYYY-MM-DDTHH' → 'HH:00'；天桶 'YYYY-MM-DD' → 'M/D'。 */
+    function bucketLabel(key, dim) {
+      if (typeof key !== 'string') return ''
+      if (dim === 'hour') {
+        var parts = key.split('T')
+        return parts.length === 2 ? parts[1] + ':00' : key
+      }
+      var bits = key.split('-')
+      return bits.length === 3 ? String(Number(bits[1])) + '/' + String(Number(bits[2])) : key
+    }
+
+    /** 完整桶标签（悬浮提示用）。 */
+    function bucketFullLabel(key, dim) {
+      if (dim === 'hour') {
+        var parts = String(key).split('T')
+        if (parts.length !== 2) return key
+        return parts[0] + ' ' + parts[1] + ':00–' + parts[1] + ':59'
+      }
+      return key + '（当日）'
+    }
+
+    /**
+     * 峰谷时段判定：与宿主 isPeakHour 同一规则（北京时间周一至周五 9–12、14–18）。
+     * 这里再算一遍是为了给"未来小时"上色——那部分没有数据、宿主不会返回 band。
+     * @param {number} ms UTC 毫秒
+     * @returns {0|1|2} 0=未知 1=空闲时段 2=高峰时段
+     */
+    function bandOf(ms) {
+      var local = new Date(ms + 8 * 3600000)
+      var day = local.getUTCDay()
+      if (day === 0 || day === 6) return 1
+      var hour = local.getUTCHours()
+      return ((hour >= 9 && hour < 12) || (hour >= 14 && hour < 18)) ? 2 : 1
+    }
+
+    /** 峰谷时段带：直方图上方一条 24 格色带，回答"哪个时段贵"。 */
+    function PeakBand(props) {
+      var buckets = props.buckets || []
+      var hours = props.hours || 24
+      var cells = []
+      for (var i = 0; i < hours; i += 1) {
+        var bucket = buckets[i]
+        var band = bucket && typeof bucket.band === 'number' && bucket.band > 0
+          ? bucket.band
+          : bandOf(Date.now())
+        cells.push(jsx.jsx('div', {
+          className: 'tm-band-cell',
+          'data-band': band,
+          title: String(i).padStart(2, '0') + ':00–' + String(i).padStart(2, '0') + ':59 · '
+            + (band === 2 ? '高峰时段（单价 ×2）' : '空闲时段（单价 ×1）'),
+        }, 'band' + i))
+      }
+      return jsx.jsx('div', { className: 'tm-band', children: cells })
+    }
+
+    /**
+     * 取响应里的币种：优先顶层 currency，其次余额的币种，最后按人民币兜底。
+     * 为什么要兜底：宿主某版 logPayload 漏传 currency 时，金额会退化成不带符号的数字。
+     */
+    function currencyOf(data) {
+      if (data && typeof data.currency === 'string' && data.currency) return data.currency
+      if (data && data.balance && typeof data.balance.currency === 'string' && data.balance.currency) return data.balance.currency
+      return 'CNY'
+    }
+
+    /** 余额是否可用（取到真实数字）。 */
+    function balanceKnown(balance) {
+      return !!(balance && balance.ok === true && typeof balance.total === 'number')
+    }
+
+    /** 余额悬浮说明：把取不到的原因讲清楚，而不是只显示一个"—"。 */
+    function balanceTitle(balance) {
+      if (balanceKnown(balance)) {
+        return '账户余额 ' + fmtMoney(balance.total, balance.currency)
+          + (balance.granted ? '\n赠送余额 ' + fmtMoney(balance.granted, balance.currency) : '')
+          + (balance.toppedUp ? '\n充值余额 ' + fmtMoney(balance.toppedUp, balance.currency) : '')
+          + (balance.available === false ? '\n⚠ 余额不足' : '')
+      }
+      var reason = balance && balance.reason
+      var why = reason === 'no-key' ? '未找到 DeepSeek API Key（可用 DEEPSEEK_API_KEY 或插件配置 apiKey）'
+        : reason === 'timeout' ? '余额接口超时'
+          : reason === 'network' ? '余额接口不可达'
+            : reason ? '余额接口返回 ' + reason : '尚未取到'
+      return '余额不可用：' + why
+    }
+
+    /** 相对时间：多久以前。 */
+    function fmtAgo(ms, now) {
+      if (typeof ms !== 'number' || ms <= 0) return '—'
+      var diff = Math.max(0, now - ms)
+      var min = Math.floor(diff / 60000)
+      if (min < 1) return '刚刚'
+      if (min < 60) return min + ' 分钟前'
+      var hour = Math.floor(min / 60)
+      if (hour < 24) return hour + ' 小时前'
+      var day = Math.floor(hour / 24)
+      if (day < 30) return day + ' 天前'
+      return new Date(ms).toISOString().slice(0, 10)
+    }
+
+    /** 上海当前日期（用于自定义日期默认值）。 */
+    function shanghaiToday(offsetMinutes) {
+      var off = typeof offsetMinutes === 'number' ? offsetMinutes : 480
+      return new Date(Date.now() + off * 60000).toISOString().slice(0, 10)
+    }
+
+    function shiftDateString(date, days) {
+      var ms = Date.parse(date + 'T00:00:00.000Z')
+      return new Date(ms + days * 86400000).toISOString().slice(0, 10)
+    }
+
+    /** fetch JSON（带超时与错误归一）。 */
+    function getJson(url, timeoutMs) {
+      var controller = typeof AbortController === 'function' ? new AbortController() : null
+      var timer = controller === null ? null : setTimeout(function () { controller.abort() }, timeoutMs || 15000)
+      return fetch(url, controller === null ? undefined : { signal: controller.signal })
+        .then(function (res) {
+          if (!res.ok) throw new Error('HTTP ' + res.status)
+          return res.json()
+        })
+        .then(function (body) {
+          if (body && body.ok === false) throw new Error(body.error || '服务端返回失败')
+          return body
+        })
+        .finally(function () { if (timer !== null) clearTimeout(timer) })
+    }
+
+    // ───────────────────────── 直方图 ─────────────────────────
+
+    /**
+     * 堆叠直方图：每根柱子 = 命中缓存输入 / 未命中输入 / 输出。
+     * 高度按「当前区间最大值」归一，因此不看绝对量级也能看出形状；
+     * 总量为 0 的桶画一条 2px 底线，保持 24 格的节奏感。
+     */
+    function Histogram(props) {
+      var buckets = props.buckets || []
+      var dim = props.dim || 'hour'
+      var hovered = props.hovered
+      var onHover = props.onHover
+      var totalOf = function (b) { return b.cr + b.ci + b.out }
+      var max = 0
+      for (var i = 0; i < buckets.length; i += 1) max = Math.max(max, totalOf(buckets[i]))
+      var cls = props.compact === true ? 'tm-chart' : 'tm-hist'
+      var colCls = props.compact === true ? 'tm-bar' : 'tm-hist-col'
+
+      return jsx.jsxs('div', {
+        children: [
+          jsx.jsx('div', {
+            className: cls,
+            children: buckets.map(function (bucket, index) {
+              var total = totalOf(bucket)
+              var has = total > 0
+              var heightPct = function (value) {
+                if (max <= 0) return 0
+                return (value / max) * 100
+              }
+              return jsx.jsxs('div', {
+                className: colCls + (hovered === index ? ' ' + (props.compact === true ? 'tm-bar-on' : 'tm-hist-col-on') : ''),
+                onMouseEnter: function () { onHover(index) },
+                onMouseLeave: function () { onHover(-1) },
+                title: bucketFullLabel(bucket.key || bucket.hourLabel, dim) + '\n命中缓存 ' + fmtFull(bucket.cr)
+                  + ' · 未命中 ' + fmtFull(bucket.ci) + ' · 输出 ' + fmtFull(bucket.out),
+                children: has
+                  ? [
+                    jsx.jsx('span', { style: { height: heightPct(bucket.out) + '%', background: COLORS.output, marginBottom: '1px' } }, 'out'),
+                    jsx.jsx('span', { style: { height: heightPct(bucket.ci) + '%', background: COLORS.uncached, marginBottom: '1px' } }, 'ci'),
+                    jsx.jsx('span', { style: { height: heightPct(bucket.cr) + '%', background: COLORS.cacheRead } }, 'cr'),
+                  ]
+                  : jsx.jsx('span', { className: 'tm-bar-empty' }),
+              }, String(bucket.key || bucket.hour || index))
+            }),
+          }),
+          props.showAxis === false ? null : jsx.jsx('div', {
+            className: 'tm-hist-axis',
+            children: buckets.map(function (bucket, index) {
+              // 只在首尾与每 N 格标注，避免挤成一团。
+              var step = buckets.length > 16 ? Math.ceil(buckets.length / 8) : (buckets.length > 8 ? 3 : 4)
+              var label = (index === 0 || index === buckets.length - 1 || index % step === 0)
+                ? bucketLabel(bucket.key || String(bucket.hour).padStart(2, '0'), bucket.key === undefined ? 'hour' : dim)
+                : ''
+              return jsx.jsx('div', { children: label }, 'ax' + index)
+            }),
+          }),
+        ],
+      })
+    }
+
+    /** 图例：显示区间合计或悬浮桶的即时数值。 */
+    function Legend(props) {
+      var value = props.value
+      var items = [
+        { key: 'cacheRead', label: '输入（命中缓存）', color: COLORS.cacheRead, n: value.cr },
+        { key: 'uncached', label: '输入（未命中缓存）', color: COLORS.uncached, n: value.ci },
+        { key: 'output', label: '输出', color: COLORS.output, n: value.out },
+      ]
+      return jsx.jsx('div', {
+        className: 'tm-legend',
+        children: items.map(function (item) {
+          return jsx.jsx('div', {
+            className: 'tm-legend-item',
+            children: [
+              jsx.jsx('i', { className: 'tm-swatch', style: { background: item.color } }),
+              jsx.jsx('span', { children: item.label }),
+              jsx.jsx('b', { children: fmtCompact(item.n) }),
+            ],
+          }, item.key)
+        }),
+      })
+    }
+
+    // ───────────────────────── 小窗口 ─────────────────────────
+
+    /**
+     * 侧边栏小窗口。数据每 POLL_MS 拉一次，并在窗口重新聚焦时立刻补一次。
+     * @param props.wide - 侧边栏是否为宽栏（false 时渲染 56px rail 形态）
+     */
+    function TokenMonitorWidget(props) {
+      var wide = props.wide !== false
+      var [state, setState] = React.useState({ status: 'loading', data: null, error: null })
+      var [hovered, setHovered] = React.useState(-1)
+      var [dialogOpen, setDialogOpen] = React.useState(false)
+
+      React.useEffect(function () { ensureStyle() }, [])
+
+      React.useEffect(function () {
+        var alive = true
+        function load() {
+          getJson(API_OVERVIEW)
+            .then(function (data) { if (alive) setState({ status: 'ready', data: data, error: null }) })
+            .catch(function (error) {
+              if (alive) setState(function (prev) {
+                // 已有数据时保留旧数据，只标记错误，避免小窗口闪烁成空。
+                return { status: prev.data === null ? 'error' : 'stale', data: prev.data, error: String(error && error.message || error) }
+              })
+            })
+        }
+        load()
+        var timer = setInterval(load, POLL_MS)
+        function onFocus() { load() }
+        window.addEventListener('focus', onFocus)
+        return function () {
+          alive = false
+          clearInterval(timer)
+          window.removeEventListener('focus', onFocus)
+        }
+      }, [])
+
+      var data = state.data
+      var models = (data && data.models) || []
+      var totals = (data && data.totals) || { cr: 0, ci: 0, out: 0, total: 0, requests: 0 }
+      var buckets = (data && data.buckets) || []
+      var currency = currencyOf(data)
+      var errorMessage = state.error
+
+      if (!wide) {
+        return jsx.jsxs('button', {
+          type: 'button',
+          className: 'tm-rail',
+          onClick: function () { setDialogOpen(true) },
+          title: 'Token 用量监测',
+          'aria-label': 'Token 用量监测',
+          children: [
+            jsx.jsx(IconDataOutline16, { size: 16 }),
+            jsx.jsx('span', { className: 'tm-rail-value', children: fmtCompact(totals.total) }),
+          ],
+        })
+      }
+
+      // 侧栏只有 96px 给名字，provider 前缀（deepseek-official/）会把它挤成 "deepseek-o…"，
+      // 所以只显示末段；完整 provider/model 放在 title 里。
+      var modelName = models.length === 0
+        ? (state.status === 'loading' ? '读取中…' : '今日暂无用量')
+        : String(models[0].key).split('/').pop()
+      var hoveredBucket = hovered >= 0 && hovered < buckets.length ? buckets[hovered] : null
+      var legendValue = hoveredBucket === null
+        ? totals
+        : { cr: hoveredBucket.cr, ci: hoveredBucket.ci, out: hoveredBucket.out }
+
+      return jsx.jsxs('div', {
+        className: 'tm-root',
+        children: [
+          jsx.jsxs('div', {
+            className: 'tm-head',
+            children: [
+              jsx.jsx('div', {
+                className: 'tm-title',
+                children: jsx.jsx('span', {
+                  className: 'tm-model' + (models.length === 0 ? ' tm-model-dim' : ''),
+                  title: models.map(function (m) { return m.key + ' · ' + fmtFull(m.total) }).join('\n') || modelName,
+                  children: modelName,
+                }),
+              }),
+              jsx.jsxs('div', {
+                className: 'tm-head-actions',
+                children: [
+                  state.status === 'stale'
+                    ? jsx.jsx('span', { className: 'tm-error', title: errorMessage, children: '离线' })
+                    : null,
+                  jsx.jsx('button', {
+                    type: 'button',
+                    className: 'tm-btn',
+                    onClick: function () { setDialogOpen(true) },
+                    title: '打开用量日志',
+                    children: '日志',
+                  }),
+                ],
+              }),
+            ],
+          }),
+
+          jsx.jsxs('div', {
+            className: 'tm-total',
+            children: [
+              jsx.jsx('span', { className: 'tm-total-value', children: fmtZh(totals.total) }),
+              jsx.jsx('span', { className: 'tm-total-label', children: '今日总量' }),
+              totals.requests > 0
+                ? jsx.jsx('span', { className: 'tm-total-label', children: '· ' + fmtCompact(totals.requests) + ' 次请求' })
+                : null,
+            ],
+          }),
+
+          /* 花费与余额：余额取不到时显示"—"并说明原因，绝不用 0 冒充（0 会被读成"没钱了"）。 */
+          jsx.jsxs('div', {
+            className: 'tm-money',
+            children: [
+              jsx.jsxs('span', {
+                className: 'tm-money-item',
+                title: '今日花费（按官方价目表逐条计价，峰谷单价不同）'
+                  + (data && data.cost ? '\n高峰 ' + fmtMoney(data.cost.peak.cost) + ' · 空闲 ' + fmtMoney(data.cost.offPeak.cost) : ''),
+                children: [
+                  jsx.jsx('span', { className: 'tm-money-value', children: fmtMoney(totals.cost, currency) }),
+                  jsx.jsx('span', { className: 'tm-money-label', children: '今日花费' }),
+                ],
+              }),
+              jsx.jsxs('span', {
+                className: 'tm-money-item',
+                title: balanceTitle(data && data.balance),
+                children: [
+                  jsx.jsx('span', {
+                    className: 'tm-money-value' + (balanceKnown(data && data.balance) ? '' : ' tm-money-dim'),
+                    children: balanceKnown(data && data.balance)
+                      ? fmtMoney(data.balance.total, data.balance.currency)
+                      : '—',
+                  }),
+                  jsx.jsx('span', { className: 'tm-money-label', children: '余额' }),
+                ],
+              }),
+              data && data.balance && data.balance.ok === true && data.balance.available === false
+                ? jsx.jsx('span', { className: 'tm-money-warn', title: '账户余额不足，API 将拒绝请求', children: '余额不足' })
+                : null,
+            ],
+          }),
+
+          /* 峰谷时段带（直方图上方）：高峰深蓝 / 空闲浅蓝。 */
+          jsx.jsx(PeakBand, { buckets: buckets, hours: 24 }),
+
+          jsx.jsx(Histogram, {
+            buckets: buckets,
+            dim: 'hour',
+            compact: true,
+            hovered: hovered,
+            onHover: setHovered,
+            showAxis: false,
+          }),
+
+          jsx.jsx('div', { className: 'tm-axis', children: [
+            jsx.jsx('span', { children: '00:00' }),
+            jsx.jsx('span', { children: '12:00' }),
+            jsx.jsx('span', { children: '23:00' }),
+          ] }),
+
+          jsx.jsx(Legend, { value: legendValue }),
+
+          jsx.jsx('div', {
+            className: 'tm-hint',
+            children: hoveredBucket === null
+              ? (state.status === 'loading' ? '正在读取会话日志…' : '悬停柱子看该小时明细')
+              : bucketFullLabel(hoveredBucket.key === undefined ? String(hoveredBucket.hour).padStart(2, '0') : hoveredBucket.key, 'hour')
+                + ' · 合计 ' + fmtFull(hoveredBucket.total),
+          }),
+
+          dialogOpen
+            ? jsx.jsx(LogDialog, { onClose: function () { setDialogOpen(false) } })
+            : null,
+        ],
+      })
+    }
+
+    // ───────────────────────── 日志弹窗 ─────────────────────────
+
+    var PRESETS = [
+      { key: 'today', label: '今日' },
+      { key: 'week', label: '近一周' },
+      { key: 'month', label: '近一月' },
+      { key: 'custom', label: '自定义' },
+    ]
+
+    /**
+     * 用量日志弹窗：区间总量 / 时间分布 / 模型分布 / 会话明细 / 健康度。
+     * 所有数字都来自同一次请求的同一份记录集（宿主保证三种分组合计相等）。
+     */
+    function LogDialog(props) {
+      var [period, setPeriod] = React.useState('today')
+      var today = shanghaiToday(480)
+      var [start, setStart] = React.useState(shiftDateString(today, -6))
+      var [end, setEnd] = React.useState(today)
+      var [view, setView] = React.useState('conversation')
+      var [state, setState] = React.useState({ status: 'loading', data: null, error: null })
+      var [hovered, setHovered] = React.useState(-1)
+      var [page, setPage] = React.useState(0)
+      var [tick, setTick] = React.useState(0)
+
+      React.useEffect(function () { ensureStyle() }, [])
+
+      var query = (function () {
+        var parts = ['period=' + encodeURIComponent(period), 'view=' + encodeURIComponent(view)]
+        if (period === 'custom') {
+          parts.push('start=' + encodeURIComponent(start))
+          parts.push('end=' + encodeURIComponent(end))
+        }
+        return parts.join('&')
+      })()
+
+      React.useEffect(function () {
+        var alive = true
+        setState(function (prev) { return { status: prev.data === null ? 'loading' : 'refreshing', data: prev.data, error: null } })
+        getJson(API_LOG + '?' + query)
+          .then(function (data) { if (alive) setState({ status: 'ready', data: data, error: null }) })
+          .catch(function (error) {
+            if (alive) setState(function (prev) { return { status: 'error', data: prev.data, error: String(error && error.message || error) } })
+          })
+        return function () { alive = false }
+      }, [query, tick])
+
+      React.useEffect(function () { setPage(0); setHovered(-1) }, [query])
+
+      var data = state.data
+      var totals = (data && data.totals) || { cr: 0, ci: 0, out: 0, total: 0, requests: 0 }
+      var buckets = (data && data.buckets) || []
+      var models = (data && data.models) || []
+      var conversations = (data && data.conversations) || []
+      var health = (data && data.health) || null
+      // 顶层 cost 缺失时（旧版宿主），用 totals.cost 重建，避免出现
+      // 「顶部花费卡显示未启用计价、而模型分布显示真实金额」这种自相矛盾。
+      var cost = (data && data.cost) || null
+      if (cost === null && data && data.totals && typeof data.totals.cost === 'number' && data.totals.cost > 0) {
+        cost = { cost: data.totals.cost, peak: { cost: 0, requests: 0, tokens: 0 }, offPeak: { cost: 0, requests: 0, tokens: 0 }, unmatchedModels: [], derived: true }
+      }
+      var currency = currencyOf(data)
+      var dim = (data && data.dim) || 'hour'
+      var hoveredBucket = hovered >= 0 && hovered < buckets.length ? buckets[hovered] : null
+
+      var rows = view === 'conversation'
+        ? conversations
+        : models.map(function (model) {
+          return {
+            id: model.key,
+            title: model.key,
+            models: [model.key],
+            workspaceLabel: null,
+            totals: model,
+            synthetic: true,
+          }
+        })
+      var pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE))
+      var safePage = Math.min(page, pageCount - 1)
+      var pageRows = rows.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE)
+
+      var rangeText = data === null
+        ? ''
+        : (data.range.start === data.range.end ? data.range.start : data.range.start + ' → ' + data.range.end)
+          + ' · 上海时区'
+
+      return jsx.jsx(Modal, {
+        open: true,
+        onClose: props.onClose,
+        // headless：自绘标题栏；className 用来把卡片宽度从 380px 拿回来
+        headless: true,
+        title: 'Token 用量日志',
+        className: 'tm-modal',
+        children: jsx.jsxs('div', {
+          className: 'tm-dialog',
+          children: [
+            jsx.jsxs('div', {
+              className: 'tm-dialog-head',
+              children: [
+                jsx.jsx('div', {
+                  children: [
+                    jsx.jsx('h2', { className: 'tm-dialog-title', children: 'Token 用量日志' }),
+                    jsx.jsx('p', { className: 'tm-dialog-desc', children: '按模型与时间统计的会话用量，数据来自本机会话日志' }),
+                  ],
+                }),
+                jsx.jsx('button', {
+                  type: 'button',
+                  className: 'tm-dialog-close',
+                  onClick: props.onClose,
+                  'aria-label': '关闭',
+                  title: '关闭',
+                  children: jsx.jsx(IconCloseOutline16, { size: 16 }),
+                }),
+              ],
+            }),
+
+            // ── 区间选择 ──
+            jsx.jsxs('div', {
+              className: 'tm-row tm-row-between',
+              children: [
+                jsx.jsxs('div', {
+                  className: 'tm-row',
+                  children: [
+                    jsx.jsx('div', {
+                      className: 'tm-group',
+                      children: PRESETS.map(function (item) {
+                        return jsx.jsx('button', {
+                          type: 'button',
+                          className: 'tm-btn',
+                          'aria-pressed': period === item.key ? 'true' : 'false',
+                          onClick: function () { setPeriod(item.key) },
+                          children: item.label,
+                        }, item.key)
+                      }),
+                    }),
+                    period === 'custom'
+                      ? jsx.jsxs('div', {
+                        className: 'tm-row',
+                        children: [
+                          jsx.jsx('input', {
+                            type: 'date', className: 'tm-date', value: start, max: end,
+                            onChange: function (event) { setStart(event.target.value || today) },
+                            'aria-label': '起始日期',
+                          }),
+                          jsx.jsx('span', { className: 'tm-range-text', children: '→' }),
+                          jsx.jsx('input', {
+                            type: 'date', className: 'tm-date', value: end, min: start,
+                            onChange: function (event) { setEnd(event.target.value || today) },
+                            'aria-label': '结束日期',
+                          }),
+                        ],
+                      })
+                      : jsx.jsx('span', { className: 'tm-range-text', children: rangeText }),
+                  ],
+                }),
+                jsx.jsxs('div', {
+                  className: 'tm-row',
+                  children: [
+                    jsx.jsxs('div', {
+                      className: 'tm-group',
+                      children: [
+                        jsx.jsx('button', {
+                          type: 'button', className: 'tm-btn',
+                          'aria-pressed': view === 'conversation' ? 'true' : 'false',
+                          onClick: function () { setView('conversation') },
+                          children: '按对话',
+                        }),
+                        jsx.jsx('button', {
+                          type: 'button', className: 'tm-btn',
+                          'aria-pressed': view === 'total' ? 'true' : 'false',
+                          onClick: function () { setView('total') },
+                          children: '按模型',
+                        }),
+                      ],
+                    }),
+                    jsx.jsx('button', {
+                      type: 'button',
+                      className: 'tm-btn tm-btn-icon',
+                      title: '重新读取会话日志',
+                      'aria-label': '刷新',
+                      disabled: state.status === 'loading' || state.status === 'refreshing',
+                      onClick: function () { setTick(function (n) { return n + 1 }) },
+                      children: jsx.jsx(IconRefreshOutline14, { size: 14 }),
+                    }),
+                  ],
+                }),
+              ],
+            }),
+
+            state.status === 'error' && state.data === null
+              ? jsx.jsx('div', { className: 'tm-error', children: '读取失败：' + state.error })
+              : null,
+
+            // ── 总量卡片 ──
+            jsx.jsxs('div', {
+              className: 'tm-cards',
+              children: [
+                card('总用量', fmtZh(totals.total), fmtFull(totals.total) + ' tokens · ' + fmtCompact(totals.requests) + ' 次请求'),
+                card('花费', fmtMoney(cost === null ? null : cost.cost, currency),
+                  cost === null ? '未启用计价'
+                    : cost.derived === true
+                      ? '今日累计（峰谷明细见小窗口）'
+                      : '高峰 ' + fmtMoney(cost.peak.cost, currency) + ' / 空闲 ' + fmtMoney(cost.offPeak.cost, currency)),
+                card('账户余额', balanceKnown(data && data.balance) ? fmtMoney(data.balance.total, data.balance.currency) : '—',
+                  balanceKnown(data && data.balance)
+                    ? (data.balance.available === false ? '⚠ 余额不足' : '赠送 ' + fmtMoney(data.balance.granted, data.balance.currency))
+                    : balanceTitle(data && data.balance)),
+                card('输入（命中缓存）', fmtZh(totals.cr), '占输入 ' + fmtPercent(totals.cr + totals.ci > 0 ? totals.cr / (totals.cr + totals.ci) : null), COLORS.cacheRead),
+                card('输入（未命中缓存）', fmtZh(totals.ci), '每次请求均 ' + fmtFull(health === null ? 0 : health.avgInputPerRequest) + ' tokens', COLORS.uncached),
+                card('输出', fmtZh(totals.out), '每次请求均 ' + fmtFull(health === null ? 0 : health.avgOutputPerRequest) + ' tokens', COLORS.output),
+              ],
+            }),
+
+            // ── 时间分布 ──
+            jsx.jsxs('div', {
+              className: 'tm-section',
+              children: [
+                jsx.jsxs('div', {
+                  className: 'tm-section-head',
+                  children: [
+                    jsx.jsxs('div', {
+                      children: [
+                        jsx.jsx('div', { className: 'tm-section-title', children: dim === 'hour' ? '每小时用量' : '每日用量' }),
+                        jsx.jsx('div', {
+                          className: 'tm-section-sub',
+                          children: hoveredBucket === null
+                            ? rangeText
+                            : bucketFullLabel(hoveredBucket.key, dim) + ' · 合计 ' + fmtFull(hoveredBucket.total)
+                              + '（命中 ' + fmtFull(hoveredBucket.cr) + ' / 未命中 ' + fmtFull(hoveredBucket.ci) + ' / 输出 ' + fmtFull(hoveredBucket.out) + '）',
+                        }),
+                      ],
+                    }),
+                    jsx.jsx(Legend, { value: hoveredBucket === null ? totals : hoveredBucket }),
+                  ],
+                }),
+                buckets.length === 0
+                  ? jsx.jsx('div', { className: 'tm-empty', children: '这个区间没有用量记录' })
+                  : jsx.jsx(Histogram, { buckets: buckets, dim: dim, hovered: hovered, onHover: setHovered }),
+              ],
+            }),
+
+            // ── 模型分布 ──
+            models.length === 0
+              ? null
+              : jsx.jsxs('div', {
+                className: 'tm-section',
+                children: [
+                  jsx.jsxs('div', {
+                    className: 'tm-section-head',
+                    children: [
+                      jsx.jsx('div', { className: 'tm-section-title', children: '模型分布' }),
+                      jsx.jsx('div', { className: 'tm-section-sub', children: models.length + ' 个模型' }),
+                    ],
+                  }),
+                  jsx.jsx('div', {
+                    className: 'tm-dist',
+                    children: models.map(function (model) {
+                      var pct = totals.total > 0 ? model.total / totals.total : 0
+                      return jsx.jsxs('div', {
+                        className: 'tm-dist-row',
+                        children: [
+                          jsx.jsx('span', { className: 'tm-dist-name', title: model.key, children: model.key }),
+                          jsx.jsx('span', {
+                            className: 'tm-dist-track',
+                            children: [
+                              jsx.jsx('span', { style: { width: (model.total > 0 ? (model.cr / model.total) * 100 : 0) + '%', background: COLORS.cacheRead } }),
+                              jsx.jsx('span', { style: { width: (model.total > 0 ? (model.ci / model.total) * 100 : 0) + '%', background: COLORS.uncached } }),
+                              jsx.jsx('span', { style: { width: (model.total > 0 ? (model.out / model.total) * 100 : 0) + '%', background: COLORS.output } }),
+                            ],
+                          }),
+                          jsx.jsx('span', { className: 'tm-dist-value', children: fmtCompact(model.total) }),
+                          jsx.jsx('span', { className: 'tm-dist-pct', children: fmtPercent(pct) }),
+                          jsx.jsx('span', { className: 'tm-dist-pct', title: '该模型区间花费', children: fmtMoney(model.cost, currency) }),
+                        ],
+                      }, model.key)
+                    }),
+                  }),
+                ],
+              }),
+
+            // ── 明细表 ──
+            jsx.jsxs('div', {
+              className: 'tm-section',
+              children: [
+                jsx.jsxs('div', {
+                  className: 'tm-section-head',
+                  children: [
+                    jsx.jsx('div', {
+                      className: 'tm-section-title',
+                      children: view === 'conversation' ? '按对话' : '按模型',
+                    }),
+                    jsx.jsx('div', {
+                      className: 'tm-section-sub',
+                      children: rows.length === 0
+                        ? '无记录'
+                        : (view === 'conversation' ? rows.length + ' 个对话' : rows.length + ' 个模型')
+                          + (pageCount > 1 ? ' · 第 ' + (safePage + 1) + '/' + pageCount + ' 页' : ''),
+                    }),
+                  ],
+                }),
+                rows.length === 0
+                  ? jsx.jsx('div', { className: 'tm-empty', children: '这个区间没有对话产生用量' })
+                  : jsx.jsx('div', {
+                    className: 'tm-table-wrap',
+                    children: jsx.jsx('table', {
+                    className: 'tm-table',
+                    children: [
+                      jsx.jsx('thead', {
+                        children: jsx.jsx('tr', {
+                          children: [
+                            jsx.jsx('th', { children: view === 'conversation' ? '对话' : '模型' }),
+                            jsx.jsx('th', { children: '输入·命中' }),
+                            jsx.jsx('th', { children: '输入·未命中' }),
+                            jsx.jsx('th', { children: '输出' }),
+                            jsx.jsx('th', { children: '合计' }),
+                            jsx.jsx('th', { children: '花费' }),
+                            jsx.jsx('th', { children: '请求' }),
+                          ],
+                        }),
+                      }),
+                      jsx.jsx('tbody', {
+                        children: pageRows.map(function (row) {
+                          return jsx.jsx('tr', {
+                            children: [
+                              jsx.jsx('td', {
+                                children: jsx.jsx('div', {
+                                  className: 'tm-cell-title',
+                                  children: [
+                                    jsx.jsx('b', { title: row.title || row.id, children: row.title || row.id }),
+                                    jsx.jsx('small', {
+                                      title: (row.models || []).join(', '),
+                                      children: (row.synthetic === true
+                                        ? '模型合计'
+                                        : (row.workspaceLabel ? row.workspaceLabel + ' · ' : '') + fmtAgo(row.lastMs, data === null ? Date.now() : data.now))
+                                        + ' · ' + (row.models || []).map(function (m) { return m.split('/').pop() }).join(', '),
+                                    }),
+                                  ],
+                                }),
+                              }),
+                              jsx.jsx('td', { children: fmtFull(row.totals.cr) }),
+                              jsx.jsx('td', { children: fmtFull(row.totals.ci) }),
+                              jsx.jsx('td', { children: fmtFull(row.totals.out) }),
+                              jsx.jsx('td', { children: jsx.jsx('b', { children: fmtZh(row.totals.total) }) }),
+                              jsx.jsx('td', { children: fmtMoney(row.totals.cost, currency) }),
+                              jsx.jsx('td', { children: fmtFull(row.totals.requests) }),
+                            ],
+                          }, row.id + ':' + (row.title || ''))
+                        }),
+                      }),
+                    ],
+                    }),
+                  }),
+                pageCount > 1
+                  ? jsx.jsxs('div', {
+                    className: 'tm-row tm-row-between',
+                    style: { marginTop: '8px' },
+                    children: [
+                      jsx.jsx('button', {
+                        type: 'button', className: 'tm-btn', disabled: safePage <= 0,
+                        onClick: function () { setPage(Math.max(0, safePage - 1)) },
+                        children: '上一页',
+                      }),
+                      jsx.jsx('span', { className: 'tm-range-text', children: (safePage + 1) + ' / ' + pageCount }),
+                      jsx.jsx('button', {
+                        type: 'button', className: 'tm-btn', disabled: safePage >= pageCount - 1,
+                        onClick: function () { setPage(Math.min(pageCount - 1, safePage + 1)) },
+                        children: '下一页',
+                      }),
+                    ],
+                  })
+                  : null,
+              ],
+            }),
+
+            // ── 健康度（第一性原理补充项：从同一份记录直接推导，不做估计）──
+            health === null
+              ? null
+              : jsx.jsxs('div', {
+                className: 'tm-section',
+                children: [
+                  jsx.jsx('div', {
+                    className: 'tm-section-head',
+                    children: [
+                      jsx.jsx('div', { className: 'tm-section-title', children: '健康度' }),
+                      jsx.jsx('div', {
+                        className: 'tm-section-sub',
+                        children: '缓存命中率是这套体系里唯一能直接省下输入成本的杠杆',
+                      }),
+                    ],
+                  }),
+                  jsx.jsxs('div', {
+                    className: 'tm-cards',
+                    children: [
+                      card('缓存命中率', fmtPercent(health.cacheHitRate), '命中 ' + fmtZh(totals.cr) + ' / 输入 ' + fmtZh(totals.cr + totals.ci)),
+                      card('活跃小时', String(health.activeHours), '闲置 ' + fmtFull(health.idleHours) + ' 小时'),
+                      card('活跃小时均值', fmtZh(health.avgPerActiveHour), '日均 ' + fmtZh(health.avgPerDay)),
+                      card('用量峰值小时', health.peakHour === null ? '—' : bucketLabel(health.peakHour.key, 'hour'), health.peakHour === null ? '无数据' : fmtZh(health.peakHour.total) + ' · ' + fmtFull(health.peakHour.requests) + ' 次请求'),
+                      card('最费对话', health.peakConversation === null ? '—' : fmtZh(health.peakConversation.total), health.peakConversation === null ? '无数据' : (health.peakConversation.title || health.peakConversation.id)),
+                      card('覆盖会话', fmtFull(health.sessionCount), '共扫描 ' + fmtFull(health.totalSessionsScanned) + ' 个会话日志'),
+                    ],
+                  }),
+                ],
+              }),
+
+            // ── 页脚 ──
+            jsx.jsxs('div', {
+              className: 'tm-foot',
+              children: [
+                jsx.jsx('span', {
+                  children: '统计口径：命中缓存 = cacheReadTokens，未命中 = inputTokens + cacheWriteTokens，输出含 reasoning；时区固定 Asia/Shanghai；'
+                    + '花费按官方价目表逐条计价（高峰时段单价 ×2）',
+                }),
+                jsx.jsx('span', {
+                  children: data === null
+                    ? ''
+                    : (state.status === 'refreshing' ? '刷新中… ' : '')
+                      + '采样于 ' + new Date(data.now).toLocaleTimeString('zh-CN', { hour12: false }),
+                }),
+              ],
+            }),
+
+            (cost && cost.unmatchedModels && cost.unmatchedModels.length > 0)
+              ? jsx.jsx('div', {
+                className: 'tm-money-warn',
+                children: '以下模型未登记单价，已按默认价（¥' + '1/百万 未命中）估算：' + cost.unmatchedModels.join(', ')
+                  + ' —— 在插件配置 pricing.models 里补上即可精确计费',
+              })
+              : null,
+
+            (data && data.errors && data.errors.length > 0)
+              ? jsx.jsx('div', {
+                className: 'tm-error',
+                children: '有 ' + data.errors.length + ' 个会话日志读取异常（已跳过，不影响其它会话）：'
+                  + data.errors.slice(0, 3).map(function (e) { return String(e.path).split('/').slice(-2).join('/') + ' — ' + e.message }).join('；'),
+              })
+              : null,
+          ],
+        }),
+      })
+    }
+
+    /** 指标卡。 */
+    function card(label, value, sub, color) {
+      return jsx.jsxs('div', {
+        className: 'tm-card',
+        children: [
+          jsx.jsxs('div', {
+            className: 'tm-card-label',
+            children: [
+              color === undefined ? null : jsx.jsx('i', { className: 'tm-swatch', style: { background: color } }),
+              jsx.jsx('span', { children: label }),
+            ],
+          }),
+          jsx.jsx('div', { className: 'tm-card-value', children: value }),
+          sub === undefined || sub === null ? null : jsx.jsx('div', { className: 'tm-card-sub', children: sub }),
+        ],
+      })
+    }
+
+    // ───────────────────────── 注册 ─────────────────────────
+
+    /** 需要 ctx.slots 才能注册；数据全部走同源 HTTP，不依赖其它客户端服务。 */
+    var inject = ['slots']
+
+    function apply(ctx) {
+      ctx.effect(function () {
+        // 注册进 ui-sidebar 声明的 footer 槽位：设置按钮上方。
+        // 槽位是别的插件声明的，必须用 inject 等待其声明出现（而不是直接 register）。
+        return ctx.slots.inject('sidebar.footer.action', function () {
+          return ctx.slots.register({
+            name: 'sidebar.footer.action',
+            id: 'token-monitor',
+            // order 越大越靠近设置按钮（footer 动作按 order 升序渲染，设置按钮在动作区下方）。
+            order: 100,
+          }, TokenMonitorWidget)
+        })
+      }, 'token-monitor: sidebar widget')
+    }
+
+    exports.apply = apply
+    exports.inject = inject
+    // 供无头测试使用（不参与宿主加载路径）
+    exports.__internals = {
+      fmtCompact: fmtCompact,
+      fmtZh: fmtZh,
+      fmtFull: fmtFull,
+      fmtPercent: fmtPercent,
+      bucketLabel: bucketLabel,
+      bucketFullLabel: bucketFullLabel,
+      fmtAgo: fmtAgo,
+      fmtMoney: fmtMoney,
+      bandOf: bandOf,
+      PeakBand: PeakBand,
+      shanghaiToday: shanghaiToday,
+      shiftDateString: shiftDateString,
+      TokenMonitorWidget: TokenMonitorWidget,
+      LogDialog: LogDialog,
+      Histogram: Histogram,
+      API_OVERVIEW: API_OVERVIEW,
+      API_LOG: API_LOG,
+    }
+    return module.exports
+  },
+})
