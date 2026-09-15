@@ -14,7 +14,8 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FAILED=0
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
-ok()  { printf '    ✅ %s\n' "$*"; }
+ok()   { printf '    ✅ %s\n' "$*"; }
+warn() { printf '    ⚠️  %s\n' "$*"; }
 bad() { printf '    ❌ %s\n' "$*"; FAILED=1; }
 
 say "1/4 客户端契约：注册 id 必须等于包名"
@@ -52,21 +53,35 @@ for f in host render; do
   fi
 done
 
-say "3/4 宿主是否已加载本插件（重启后才有意义）"
-DUMP="$(cd /opt/deepseek-harness && DSH_HOME=/root/.dsh timeout 120 pnpm dsh --profile web --dump-config 2>&1 || true)"
-if printf '%s' "$DUMP" | grep -q "@local/dsh-token-monitor"; then
-  ok "profile 里已挂载"
+# 自动探测本机的 dsh 环境（发布给别人用，不能假设路径与运行状态）
+DSH_CHECKOUT="${DSH_CHECKOUT:-/opt/deepseek-harness}"
+DSH_HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
+PROFILE="${DSH_PROFILE:-web}"
+LOG="${DSH_LOG:-/var/log/dsh-web.log}"
+SKIPPED_LIVE=0
+
+say "3/4 宿主是否已加载本插件"
+if [ ! -d "$DSH_CHECKOUT" ] || [ ! -d "$DSH_HOME_DIR/profiles/$PROFILE" ]; then
+  SKIPPED_LIVE=1
+  warn "未检测到 dsh 环境（$DSH_CHECKOUT / profiles/$PROFILE），跳过"
 else
-  bad "profile 里没有本插件（先跑 dsh plugin --profile web add）"
-fi
-if printf '%s' "$DUMP" | grep -qiE "cannot find|failed to load"; then
-  bad "dump-config 里出现加载错误"
+  DUMP="$(cd "$DSH_CHECKOUT" && DSH_HOME="$DSH_HOME_DIR" timeout 120 pnpm dsh --profile "$PROFILE" --dump-config 2>&1 || true)"
+  if printf '%s' "$DUMP" | grep -q "@local/dsh-token-monitor"; then
+    ok "profile 里已挂载"
+  else
+    bad "profile 里没有本插件（先跑 dsh plugin --profile $PROFILE add .）"
+  fi
+  if printf '%s' "$DUMP" | grep -qiE "cannot find|failed to load"; then
+    bad "dump-config 里出现加载错误"
+  fi
 fi
 
 say "4/4 真浏览器 boot 审计（唯一能发现『整个应用挂不挂载』的一层)"
-TOKEN="$(grep -oE 'token=[A-Za-z0-9_-]+' /var/log/dsh-web.log | tail -1 || true)"
-if [ -z "$TOKEN" ]; then
-  bad "取不到 web token，无法做 boot 审计（去日志里确认 dsh web 是否正常启动）"
+TOKEN="$(grep -oE 'token=[A-Za-z0-9_-]+' "$LOG" 2>/dev/null | tail -1 || true)"
+if [ "$SKIPPED_LIVE" = "1" ]; then
+  warn "本机没有可审计的 dsh web，跳过 boot 审计（发布/CI 场景下的正常结果）"
+elif [ -z "$TOKEN" ]; then
+  bad "取不到 web token，无法做 boot 审计（去 $LOG 里确认 dsh web 是否正常启动）"
 elif ! command -v node >/dev/null; then
   bad "没有 node"
 else
@@ -82,7 +97,9 @@ fi
 say "结论"
 if [ "$FAILED" = "0" ]; then
   cat <<'EOF'
-    ✅ 四层全过：客户端契约 / 宿主逻辑 / 元素树 / 真浏览器 boot。
+    ✅ 检查全过（客户端契约 / 关键代码块 / 宿主逻辑 / 元素树 / 真浏览器 boot）。
+       ⚠ 注意：跳过 boot 审计时，只证明"代码与单元测试没问题"，
+         不能证明"装到真机上界面会正常" —— 那一层必须在有 dsh web 的机器上跑。
        客户端改动刷新页面即可；宿主改动需要重启（务必用 systemd-run 定时重启，
        不要直接 systemctl restart —— agent 自己是这个服务的子进程，会被一起杀掉）。
 EOF
@@ -90,7 +107,8 @@ EOF
 fi
 cat <<'EOF'
     ❌ 有检查失败 —— 【不要】宣布完成，也【不要】重启服务。
-       若失败在 boot 审计：说明这版会让整个 GUI 起不来，先回滚：
-         cp -a /root/archive/dsh-token-monitor-backups/ 里对应备份回 /root/apps/dsh-plugin-token-monitor/
+       若失败在 boot 审计：说明这版会让整个 GUI 起不来。先回滚到上一个能用的提交：
+         git -C <插件目录> checkout HEAD -- client.js index.js
+         然后重启 dsh web（务必用定时重启，别在自己这一轮对话里直接 restart）。
 EOF
 exit 1

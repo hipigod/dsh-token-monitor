@@ -1,5 +1,10 @@
 // 客户端纯函数测试：把 client.js 装进假模块加载器后直接调用其内部工具
 import { strict as assert } from 'node:assert'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/** 包根目录（从本文件位置推导，克隆到哪都能跑）。 */
+const PKG = dirname(dirname(fileURLToPath(import.meta.url)))
 
 global.window = {
   __ModuleLoader__: {
@@ -8,7 +13,7 @@ global.window = {
     },
   },
 }
-await import('/root/apps/dsh-plugin-token-monitor/client.js')
+await import(`file://${join(PKG, 'client.js')}`)
 const m = global.__reg.factory((spec) => {
   if (spec === 'react') return { useState: (v) => [v, () => {}], useEffect: () => {}, createElement: () => null }
   if (spec === 'react/jsx-runtime') return { jsx: (...a) => a, jsxs: (...a) => a, Fragment: 'f' }
@@ -89,8 +94,8 @@ t('fmtAgo 分档', () => {
 console.log('== 导出契约 ==')
 t('注册 id 必须等于包名（不等于包名 → 浏览器 boot 直接抛 "loaded without registering"）', async () => {
   const { readFileSync } = await import('node:fs')
-  const src = readFileSync('/root/apps/dsh-plugin-token-monitor/client.js', 'utf8')
-  const declared = JSON.parse(readFileSync('/root/apps/dsh-plugin-token-monitor/package.json', 'utf8')).name
+  const src = readFileSync(join(PKG, 'client.js'), 'utf8')
+  const declared = JSON.parse(readFileSync(join(PKG, 'package.json'), 'utf8')).name
   const found = /id:\s*["']([^"']+)["']/.exec(src)
   assert.ok(found, 'client.js 必须声明 __ModuleLoader__.load({id})')
   assert.equal(found[1], declared, '注册 id 与 package.json 的 name 必须一致，否则模块表的 arrive() 会失败')

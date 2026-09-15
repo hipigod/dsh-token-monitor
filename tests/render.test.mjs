@@ -1,6 +1,11 @@
 // 无头渲染校验：用假 React 直接调用组件函数，检查真实返回的元素树
 // （元素树是普通对象：type/className/style/children 都是数据，可以逐项断言）
 import { strict as assert } from 'node:assert'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/** 包根目录（从本文件位置推导，克隆到哪都能跑）。 */
+const PKG = dirname(dirname(fileURLToPath(import.meta.url)))
 import { readFileSync, existsSync } from 'node:fs'
 
 const hooks = { cursor: 0, inject: {}, effects: [] }
@@ -18,7 +23,7 @@ global.fetch = async (url) => {
   throw new Error('offline-test')
 }
 
-await import('/root/apps/dsh-plugin-token-monitor/client.js')
+await import(`file://${join(PKG, 'client.js')}`)
 const m = global.__reg.factory((spec) => {
   if (spec === 'react') {
     return {
@@ -256,7 +261,7 @@ t('ensureStyle 幂等：CSS 只注入一次', () => {
     querySelector: () => (injected.length > 0 ? {} : null),
   }
   // 重新加载模块以获得干净的样式状态
-  return import('/root/apps/dsh-plugin-token-monitor/client.js?v=' + Date.now()).then(() => {
+  return import(`file://${join(PKG, 'client.js')}?v=` + Date.now()).then(() => {
     delete global.document
     assert.ok(true)
   })

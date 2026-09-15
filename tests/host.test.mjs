@@ -3,7 +3,12 @@ import { strict as assert } from 'node:assert'
 import { createServer } from 'node:http'
 import { readdirSync, readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import * as mod from '/root/apps/dsh-plugin-token-monitor/index.js'
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/** 包根目录（从本文件位置推导，克隆到哪都能跑）。 */
+const PKG = dirname(dirname(fileURLToPath(import.meta.url)))
+const mod = await import(`file://${join(PKG, 'index.js')}`)
 
 const {
   shanghaiParts, shanghaiDate, shanghaiDayStart, shiftDate,

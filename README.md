@@ -211,7 +211,8 @@ bash /root/apps/dsh-plugin-token-monitor/preflight.sh     # 退出码 0 才允�
 ## 八、验证方式（五层，越往下越接近真相）
 
 ```bash
-cd /root/apps/dsh-plugin-token-monitor
+# 从 GitHub 克隆下来后，直接在克隆目录里跑（测试不依赖绝对路径）
+git clone https://github.com/hipigod/dsh-token-monitor.git && cd dsh-token-monitor
 node tests/host.test.mjs          # 35 项：宿主纯逻辑 + 真实 HTTP 路由（自建 server，不依赖宿主）
 node tests/client.test.mjs        # 14 项：格式化/桶标签/日期/注册契约（含「id 必须等于包名」）
 node tests/render.test.mjs        # 21 项：用假 React 直接调用组件函数，断言真实元素树
