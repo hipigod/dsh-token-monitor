@@ -109,7 +109,7 @@ t('apply/inject 形状正确（slots 依赖）', () => {
   assert.equal(typeof m.apply, 'function')
   assert.deepEqual(m.inject, ['slots'])
 })
-t('apply 走 slots.inject 等待槽位声明，注册进 sidebar.footer.action 且带 id/order', () => {
+t('apply 走 slots.inject 等待槽位声明，注册进 shell.overlay 且带 id/order', () => {
   let registered = null
   let injectedName = null
   const ctx = {
@@ -120,8 +120,8 @@ t('apply 走 slots.inject 等待槽位声明，注册进 sidebar.footer.action �
     },
   }
   m.apply(ctx)
-  assert.equal(injectedName, 'sidebar.footer.action')
-  assert.equal(registered.opts.name, 'sidebar.footer.action')
+  assert.equal(injectedName, 'shell.overlay')
+  assert.equal(registered.opts.name, 'shell.overlay')
   assert.equal(registered.opts.id, 'token-monitor')
   assert.equal(typeof registered.opts.order, 'number')
   assert.equal(registered.component, i.TokenMonitorWidget)

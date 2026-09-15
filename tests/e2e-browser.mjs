@@ -77,73 +77,129 @@ ok('应用真的挂载了（不是只剩失败横幅）', () => {
   assert.equal(boot.appMounted, true, '侧栏 / New Session 未渲染')
 })
 
-console.log('== 小窗口 ==')
-const w = await page.evaluate(() => {
-  const model = document.querySelector('.tm-model')
-  const btn = [...document.querySelectorAll('.tm-root button')].find(b => b.innerText.trim() === '日志')
-  if (!model || !btn) return { missing: true, body: (document.body.innerText || '').slice(0, 300) }
-  const r = (n) => n.getBoundingClientRect()
-  const m = r(model), g = r(btn)
+console.log('== 浮窗：位置（会话列表下方、页脚上方）==')
+const f = await page.evaluate(() => {
+  const box = (n) => { if (!n) return null; const r = n.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), right: Math.round(r.right), bottom: Math.round(r.bottom) } }
+  const float = document.querySelector('.tm-float')
+  const sidebar = document.querySelector('[class*="sidebar"]')
+  const foot = document.querySelector('[class*="footArea"]')
+  const region = document.querySelector('[class*="regionArea"]')
+  const model = float && float.querySelector('.tm-model')
+  const btn = float && [...float.querySelectorAll('button')].find(b => b.innerText.trim() === '日志')
+  const minBtn = float && float.querySelector('button[aria-label="最小化"]')
   return {
-    missing: false,
-    hasRoot: !!document.querySelector('.tm-root'),
-    model: model.innerText,
-    modelTitle: model.getAttribute('title'),
-    total: document.querySelector('.tm-total-value').innerText,
-    barCount: document.querySelectorAll('.tm-bar').length,
-    legend: [...document.querySelectorAll('.tm-legend-item')].map(n => n.innerText.replace(/\n/g, ' ')),
-    axisLabels: [...document.querySelectorAll('.tm-axis span')].map(n => n.innerText),
-    overlap: !(m.right <= g.x || g.right <= m.x || m.bottom <= g.y || g.bottom <= m.y),
-    modelWidth: Math.round(m.width),
+    hasFloat: !!float,
+    float: box(float), sidebar: box(sidebar), foot: box(foot), region: box(region),
+    model: model && model.innerText,
+    modelTitle: model && model.getAttribute('title'),
+    total: float && float.querySelector('.tm-total-value') && float.querySelector('.tm-total-value').innerText,
     money: [...document.querySelectorAll('.tm-money-item')].map(n => n.innerText.replace(/\n/g, ' ')),
     moneyTitle: (document.querySelector('.tm-money-item') || {}).title || '',
-    balanceText: [...document.querySelectorAll('.tm-money-item')].map(n => n.innerText).find(t => /余额/.test(t)) || '',
+    hasLog: !!btn, hasMin: !!minBtn,
+    barCount: document.querySelectorAll('.tm-bar').length,
     bandCells: document.querySelectorAll('.tm-band-cell').length,
     bandPeak: document.querySelectorAll('.tm-band-cell[data-band="2"]').length,
     bandIdle: document.querySelectorAll('.tm-band-cell[data-band="1"]').length,
-    sameRowAsSettings: (() => {
-      const fa = document.querySelector('[class*="footerActions"]')
-      const sa = document.querySelector('[class*="settingsArea"]')
-      return !!(fa && sa && (fa.compareDocumentPosition(sa) & Node.DOCUMENT_POSITION_FOLLOWING))
-    })(),
+    legend: [...document.querySelectorAll('.tm-legend-item')].map(n => n.innerText.replace(/\n/g, ' ')),
+    axisLabels: [...document.querySelectorAll('.tm-axis span')].map(n => n.innerText),
+    // 位置关系：会话列表下方（不压住列表可见区）+ 页脚上方
+    inSidebarX: !!(float && sidebar && float.getBoundingClientRect().left >= sidebar.getBoundingClientRect().left - 1
+      && float.getBoundingClientRect().right <= sidebar.getBoundingClientRect().right + 1),
+    aboveFoot: !!(float && foot && float.getBoundingClientRect().bottom <= foot.getBoundingClientRect().top + 1),
   }
 })
-ok('小窗口已渲染', () => assert.ok(!w.missing && w.hasRoot, '未找到 .tm-root / 元素缺失；页面文本: ' + (w.body || '')))
-ok('显示模型名 + 今日总量', () => {
-  assert.ok(w.model.length > 0, '模型名为空')
-  assert.ok(/[0-9]/.test(w.total), '总量无数字: ' + w.total)
-  assert.ok(w.modelTitle.includes('/'), '完整 provider/model 应保留在 title: ' + w.modelTitle)
+ok('浮窗已渲染（不再是侧栏 footer 里的一行）', () => {
+  assert.equal(f.hasFloat, true, '未找到 .tm-float')
+  assert.ok(f.float.w >= 160 && f.float.h >= 140, '浮窗尺寸异常（应能容纳头部+总量+花费+图例）: ' + JSON.stringify(f.float))
 })
-ok('直方图 24 根柱子', () => assert.equal(w.barCount, 24, '实际 ' + w.barCount))
-ok('三桶图例齐备', () => assert.equal(w.legend.length, 3, JSON.stringify(w.legend)))
-ok('模型名与【日志】按钮不重叠', () => assert.equal(w.overlap, false, '矩形相交'))
-ok('模型名宽度随容器自适应（不是被硬压成固定 96px）', () => {
-  assert.ok(w.modelWidth >= 96, '名字宽度应 >= 保底 96px，实际 ' + w.modelWidth)
-  assert.ok(w.modelWidth <= 190, '名字宽度应 <= 上限 190px，实际 ' + w.modelWidth)
+ok('横向落在侧边栏内', () => assert.equal(f.inSidebarX, true, JSON.stringify({ float: f.float, sidebar: f.sidebar })))
+ok('纵向在页脚上方（不再被 Cordis Plugin 区挤占）', () => {
+  assert.equal(f.aboveFoot, true, `浮窗底 ${f.float.bottom} 应 <= 页脚顶 ${f.foot && f.foot.y}`)
 })
-ok('位于设置按钮上方', () => assert.equal(w.sameRowAsSettings, true))
-ok('轴标注 00:00 / 12:00 / 23:00', () => assert.deepEqual(w.axisLabels, ['00:00', '12:00', '23:00']))
-ok('显示今日花费与余额', () => {
-  assert.equal(w.money.length, 2, '应有两项：花费 + 余额，实际 ' + JSON.stringify(w.money))
-  assert.ok(/今日花费/.test(w.money[0]), '第一项应是今日花费: ' + w.money[0])
-  assert.ok(/余额/.test(w.money[1]), '第二项应是余额: ' + w.money[1])
-  // 花费必须有真实数字（不是 — 或 0）
-  const cost = w.money[0].replace(/[^0-9.]/g, '')
-  assert.ok(Number(cost) > 0, '今日花费应大于 0，实际: ' + w.money[0])
-  // 余额允许是「—」（接口不可用时降级），若给了数字则必须能解析
-  const bal = w.money[1].replace(/[^0-9.]/g, '')
-  assert.ok(/—/.test(w.money[1]) || Number(bal) >= 0, '余额格式异常: ' + w.money[1])
-  assert.ok(/高峰|空闲/.test(w.moneyTitle), '花费悬浮应给出峰谷分解: ' + w.moneyTitle)
+ok('位于会话列表区域下方，不压住列表顶部', () => {
+  assert.ok(f.region, '未找到 regionArea')
+  assert.ok(f.float.y > f.region.y + 40, `浮窗顶 ${f.float.y} 应明显低于区域顶 ${f.region.y}`)
 })
-ok('峰谷时段带：24 格且峰/谷都有（颜色能区分开）', () => {
-  assert.equal(w.bandCells, 24, '时段带应 24 格，实际 ' + w.bandCells)
-  assert.ok(w.bandPeak > 0, '应有高峰格')
-  assert.ok(w.bandIdle > 0, '应有空闲格')
-  assert.equal(w.bandPeak + w.bandIdle, 24, '每格都应有明确峰谷属性')
+ok('头部右上角有【日志】与【最小化】', () => {
+  assert.equal(f.hasLog, true, '缺日志按钮')
+  assert.equal(f.hasMin, true, '缺最小化按钮')
+})
+ok('显示模型名 + 今日总量 + 花费 + 余额', () => {
+  assert.ok(f.model && f.model.length > 0, '模型名为空')
+  assert.ok(/[0-9]/.test(f.total), '总量无数字: ' + f.total)
+  assert.equal(f.money.length, 2, '应有花费与余额两项: ' + JSON.stringify(f.money))
+  const cost = f.money[0].replace(/[^0-9.]/g, '')
+  assert.ok(Number(cost) > 0, '今日花费应大于 0: ' + f.money[0])
+  assert.ok(/高峰|空闲/.test(f.moneyTitle), '花费悬浮应给出峰谷分解: ' + f.moneyTitle)
+})
+ok('直方图 24 柱 + 峰谷带 24 格且峰谷都有', () => {
+  assert.equal(f.barCount, 24, '实际 ' + f.barCount)
+  assert.equal(f.bandCells, 24, '峰谷带实际 ' + f.bandCells)
+  assert.ok(f.bandPeak > 0 && f.bandIdle > 0, `峰谷应都有: 峰 ${f.bandPeak} 谷 ${f.bandIdle}`)
+})
+ok('三桶图例齐备 + 轴标注', () => {
+  assert.equal(f.legend.length, 3, JSON.stringify(f.legend))
+  assert.deepEqual(f.axisLabels, ['00:00', '12:00', '23:00'])
 })
 
+console.log('== 浮窗：拖动与最小化 ==')
+const head = await page.$('.tm-float-head')
+const hb = await head.boundingBox()
+await page.mouse.move(hb.x + hb.width / 2, hb.y + hb.height / 2)
+await page.mouse.down()
+await page.mouse.move(hb.x + hb.width / 2 + 60, hb.y + hb.height / 2 + 40, { steps: 8 })
+await page.mouse.up()
+await page.waitForTimeout(600)
+const dragged = await page.evaluate(() => {
+  const r = document.querySelector('.tm-float').getBoundingClientRect()
+  return { x: Math.round(r.x), y: Math.round(r.y) }
+})
+ok('拖动后位置真的变了', () => {
+  assert.ok(Math.abs(dragged.x - f.float.x) > 30 || Math.abs(dragged.y - f.float.y) > 20,
+    `拖动无效: ${JSON.stringify(f.float)} → ${JSON.stringify(dragged)}`)
+})
+// 双击头部回到默认锚点
+await page.mouse.dblclick(dragged.x + 80, dragged.y + 10)
+await page.waitForTimeout(600)
+const restored = await page.evaluate(() => {
+  const r = document.querySelector('.tm-float').getBoundingClientRect()
+  const foot = document.querySelector('[class*="footArea"]')
+  return { x: Math.round(r.x), bottom: Math.round(r.bottom), footTop: foot ? Math.round(foot.getBoundingClientRect().top) : null }
+})
+ok('双击头部回到默认锚点（页脚上方）', () => {
+  assert.ok(restored.footTop === null || restored.bottom <= restored.footTop + 1,
+    `未回到锚点: ${JSON.stringify(restored)}`)
+})
+// 最小化 → 胶囊 → 还原
+await page.click('button[aria-label="最小化"]')
+await page.waitForTimeout(600)
+const pill = await page.evaluate(() => {
+  const el = document.querySelector('.tm-pill')
+  const foot = document.querySelector('[class*="footArea"]')
+  return {
+    exists: !!el,
+    floatGone: !document.querySelector('.tm-float'),
+    text: el ? el.innerText.replace(/\n/g, ' ') : '',
+    aboveFoot: !!(el && foot && el.getBoundingClientRect().bottom <= foot.getBoundingClientRect().top + 1),
+  }
+})
+ok('最小化后变成小胶囊，浮窗消失', () => {
+  assert.equal(pill.exists, true, '未找到 .tm-pill')
+  assert.equal(pill.floatGone, true, '浮窗应消失')
+  assert.ok(/[0-9]/.test(pill.text), '胶囊应显示数字: ' + pill.text)
+  assert.equal(pill.aboveFoot, true, '胶囊也应在页脚上方')
+})
+await page.click('.tm-pill')
+await page.waitForTimeout(600)
+const back = await page.evaluate(() => !!document.querySelector('.tm-float'))
+ok('点胶囊可还原浮窗', () => assert.equal(back, true))
+
 console.log('== 日志弹窗 ==')
-await page.evaluate(() => { [...document.querySelectorAll('.tm-root button')].find(b => b.innerText.trim() === '日志').click() })
+await page.evaluate(() => {
+  const btn = [...document.querySelectorAll('.tm-float button')].find(b => b.innerText.trim() === '日志')
+  if (btn === undefined) throw new Error('浮窗里找不到【日志】按钮，实际按钮: ' + [...document.querySelectorAll('.tm-float button')].map(b => b.innerText.trim()).join('/'))
+  btn.click()
+})
 await page.waitForTimeout(3500)
 
 // 矮视口回归（用户实测场景）：笔记本 + 浏览器工具栏后可用高度可能只有 ~550px，
@@ -152,7 +208,11 @@ const small = await context.newPage()
 await small.setViewportSize({ width: 1280, height: 560 })
 await small.goto(`${base}/?${token}`, { waitUntil: 'domcontentloaded', timeout: 40000 })
 await small.waitForTimeout(5000)
-await small.evaluate(() => { [...document.querySelectorAll('.tm-root button')].find(b => b.innerText.trim() === '日志').click() })
+await small.evaluate(() => {
+  const btn = [...document.querySelectorAll('.tm-float button')].find(b => b.innerText.trim() === '日志')
+  if (btn === undefined) throw new Error('矮视口：浮窗里找不到【日志】按钮')
+  btn.click()
+})
 await small.waitForTimeout(3000)
 const sv = await small.evaluate(() => {
   const card = document.querySelector('[role="dialog"]')
@@ -224,7 +284,7 @@ console.log('== 硬刷新后仍然正常 ==')
 await page.reload({ waitUntil: 'domcontentloaded', timeout: 40000 })
 await page.waitForTimeout(7000)
 const after = await page.evaluate(() => ({
-  widget: !!document.querySelector('.tm-root'),
+  widget: !!document.querySelector('.tm-float'),
   appMounted: [...document.querySelectorAll('button')].some(b => /New Session/i.test(b.innerText)),
   banner: /Failed to load plugins/i.test(document.body.innerText || ''),
 }))

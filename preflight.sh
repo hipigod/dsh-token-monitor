@@ -35,7 +35,10 @@ mark() { if ! grep -q "$1" "$DIR/client.js"; then MISSING="$MISSING $2"; fi; }
 mark "className: 'tm-money'" "小窗口花费/余额行"
 mark "jsx.jsx(PeakBand" "峰谷时段带渲染"
 mark "jsx.jsxs('span', {" "余额项结构"
-mark "sidebar.footer.action" "槽位注册"
+mark "'shell.overlay'" "浮层槽位注册"
+mark "className: 'tm-float'" "浮窗外壳"
+mark "'最小化'" "最小化按钮"
+mark "onMouseDown: onHeadMouseDown" "拖动处理器"
 mark '@local/dsh-token-monitor' "注册 id"
 if [ -z "$MISSING" ]; then
   ok "关键代码块齐备"

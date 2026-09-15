@@ -77,6 +77,26 @@ window.__ModuleLoader__.load({
       '.tm-total-value{font-size:17px;font-weight:700;letter-spacing:-.01em;font-variant-numeric:tabular-nums}',
       '.tm-total-label{font-size:11px;color:var(--dsw-alias-label-tertiary)}',
 
+      // 浮窗外壳：挂进 shell.overlay（该层 pointer-events:none，直接子元素自动恢复 auto）。
+      // 用 position:fixed 锚定到侧边栏几何，随侧边栏宽度/收起状态与窗口尺寸实时跟随。
+      '.tm-float{position:fixed;z-index:30;display:flex;flex-direction:column;box-sizing:border-box;'
+        + 'border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);'
+        + 'box-shadow:var(--dsw-elevation-prominent,0 8px 24px rgba(0,0,0,.18));overflow:hidden}',
+      '.tm-float-head{display:flex;align-items:center;gap:4px;padding:4px 6px 0 8px;cursor:grab;user-select:none}',
+      '.tm-float-head:active{cursor:grabbing}',
+      '.tm-float-body{padding:0 10px 8px}',
+      '.tm-float-icon{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;flex:none;'
+        + 'border:none;border-radius:5px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;padding:0}',
+      '.tm-float-icon:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      // 最小化后的胶囊
+      '.tm-pill{position:fixed;z-index:30;display:flex;align-items:center;gap:6px;padding:4px 8px;cursor:pointer;'
+        + 'border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:var(--dsw-alias-bg-layer-1);'
+        + 'box-shadow:var(--dsw-elevation-prominent,0 6px 16px rgba(0,0,0,.16));'
+        + 'font:var(--dsw-font-xs-12,12px/1.4 ui-sans-serif,system-ui,"PingFang SC",sans-serif);color:var(--dsw-alias-label-primary)}',
+      '.tm-pill:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.tm-pill-total{font-weight:700;font-variant-numeric:tabular-nums}',
+      '.tm-pill-money{font-size:10.5px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
+
       // 花费/余额行
       '.tm-money{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;padding-top:1px}',
       '.tm-money-item{display:flex;align-items:baseline;gap:3px;min-width:0}',
@@ -451,17 +471,93 @@ window.__ModuleLoader__.load({
 
     // ───────────────────────── 小窗口 ─────────────────────────
 
+    // ───────────────────────── 浮窗锚定与状态 ─────────────────────────
+
+    /** localStorage 键：最小化状态与拖拽后的位置（刷新后保留）。 */
+    var LS_MIN = 'dsh-token-monitor:minimized'
+    var LS_POS = 'dsh-token-monitor:pos'
+
+    function readLS(key, fallback) {
+      try {
+        var raw = window.localStorage.getItem(key)
+        return raw === null ? fallback : raw
+      } catch { return fallback }
+    }
+
+    function writeLS(key, value) {
+      try { window.localStorage.setItem(key, value) } catch { /* 隐私模式下写不了，忽略 */ }
+    }
+
     /**
-     * 侧边栏小窗口。数据每 POLL_MS 拉一次，并在窗口重新聚焦时立刻补一次。
-     * @param props.wide - 侧边栏是否为宽栏（false 时渲染 56px rail 形态）
+     * 测量锚点：把浮窗放到「会话列表下方、侧栏页脚上方」。
+     *
+     * 为什么不写死坐标：侧边栏宽度可调、可收起，页脚高度随 Cordis Plugin 等条目变化，
+     * 写死任何一个都会在别人机器上错位。这里实时量 .sidebar 与页脚容器的矩形。
+     *
+     * @returns {{left:number, width:number, bottom:number}} 视口坐标下的锚点
+     */
+    function measureAnchor() {
+      var vw = window.innerWidth
+      var vh = window.innerHeight
+      var sidebar = document.querySelector('[class*="sidebar"]')
+      if (sidebar === null) sidebar = document.querySelector('nav')
+      var rect = sidebar === null ? null : sidebar.getBoundingClientRect()
+      var footer = document.querySelector('[class*="footArea"]')
+      var footerTop = footer === null ? null : footer.getBoundingClientRect().top
+      // 收起成窄栏时宽度很小，此时浮窗按窄形态排布
+      var width = rect === null || rect.width < 8 ? 224 : Math.max(180, Math.min(rect.width - 16, 320))
+      return {
+        left: rect === null ? 12 : Math.max(8, rect.left + 8),
+        width: width,
+        bottom: footerTop === null ? 96 : Math.max(24, vh - footerTop + 8),
+      }
+    }
+
+    /**
+     * 浮窗。数据每 POLL_MS 拉一次，并在窗口聚焦时补一次。
+     * 右上角【最小化】收成胶囊，点胶囊还原；头部可拖动，位置记在 localStorage。
+     *
+     * @param props.owner 由 shell.overlay 传入（该槽位 owner 为空对象）
      */
     function TokenMonitorWidget(props) {
-      var wide = props.wide !== false
+      var [anchor, setAnchor] = React.useState(measureAnchor)
+      var [pos, setPos] = React.useState(function () {
+        var raw = readLS(LS_POS, '')
+        if (raw === '') return null
+        try {
+          var parsed = JSON.parse(raw)
+          return (typeof parsed.left === 'number' && typeof parsed.top === 'number') ? parsed : null
+        } catch { return null }
+      })
+      var [minimized, setMinimized] = React.useState(function () { return readLS(LS_MIN, '0') === '1' })
+      var dragRef = React.useRef(null)
+
+      React.useEffect(function () { ensureStyle() }, [])
+
+      // 锚点跟随：侧栏宽度变化 / 页脚高度变化 / 窗口尺寸变化都要重新量。
+      React.useEffect(function () {
+        var update = function () { setAnchor(measureAnchor()) }
+        update()
+        window.addEventListener('resize', update)
+        var observers = []
+        if (typeof ResizeObserver === 'function') {
+          for (var node of [document.querySelector('[class*="sidebar"]'), document.querySelector('[class*="footArea"]')]) {
+            if (node !== null) {
+              var ro = new ResizeObserver(update)
+              ro.observe(node)
+              observers.push(ro)
+            }
+          }
+        }
+        return function () {
+          window.removeEventListener('resize', update)
+          for (var ro of observers) ro.disconnect()
+        }
+      }, [])
+
       var [state, setState] = React.useState({ status: 'loading', data: null, error: null })
       var [hovered, setHovered] = React.useState(-1)
       var [dialogOpen, setDialogOpen] = React.useState(false)
-
-      React.useEffect(function () { ensureStyle() }, [])
 
       React.useEffect(function () {
         var alive = true
@@ -493,20 +589,6 @@ window.__ModuleLoader__.load({
       var currency = currencyOf(data)
       var errorMessage = state.error
 
-      if (!wide) {
-        return jsx.jsxs('button', {
-          type: 'button',
-          className: 'tm-rail',
-          onClick: function () { setDialogOpen(true) },
-          title: 'Token 用量监测',
-          'aria-label': 'Token 用量监测',
-          children: [
-            jsx.jsx(IconDataOutline16, { size: 16 }),
-            jsx.jsx('span', { className: 'tm-rail-value', children: fmtCompact(totals.total) }),
-          ],
-        })
-      }
-
       // 侧栏只有 96px 给名字，provider 前缀（deepseek-official/）会把它挤成 "deepseek-o…"，
       // 所以只显示末段；完整 provider/model 放在 title 里。
       var modelName = models.length === 0
@@ -517,11 +599,102 @@ window.__ModuleLoader__.load({
         ? totals
         : { cr: hoveredBucket.cr, ci: hoveredBucket.ci, out: hoveredBucket.out }
 
-      return jsx.jsxs('div', {
-        className: 'tm-root',
+      /** 最小化/还原，状态记在 localStorage（刷新后保持用户选择）。 */
+      function toggleMinimized() {
+        setMinimized(function (prev) {
+          writeLS(LS_MIN, prev ? '0' : '1')
+          return !prev
+        })
+      }
+
+      /**
+       * 头部拖动。用 mouse 事件而不是 pointer 事件：
+       * 实测 React 的 onPointerDown 在无头 Chromium 下不触发（拖动完全失效），
+       * mouse 系列最稳；顺带在拖动时给 body 加 cursor/禁用选中。
+       */
+      function onHeadMouseDown(event) {
+        if (event.button !== 0) return
+        if (event.target && event.target.closest && event.target.closest('button') !== null) return
+        var el = event.currentTarget.parentElement
+        if (el === null) return
+        var rect = el.getBoundingClientRect()
+        dragRef.current = { dx: event.clientX - rect.left, dy: event.clientY - rect.top, moved: false }
+        document.body.style.userSelect = 'none'
+        event.preventDefault()
+      }
+
+      function onHeadDoubleClick() { resetPosition() }
+
+      // 拖动期间把 move/up 挂在 window 上：指针滑出头部也不会丢事件。
+      React.useEffect(function () {
+        function onMove(event) {
+          var drag = dragRef.current
+          if (drag === null) return
+          var width = event.clientX - drag.dx
+          var height = event.clientY - drag.dy
+          drag.moved = true
+          setPos({
+            left: Math.max(4, Math.min(width, window.innerWidth - 80)),
+            top: Math.max(4, Math.min(height, window.innerHeight - 40)),
+          })
+        }
+        function onUp() {
+          if (dragRef.current === null) return
+          var moved = dragRef.current.moved
+          dragRef.current = null
+          document.body.style.userSelect = ''
+          if (moved) {
+            setPos(function (current) {
+              if (current !== null) writeLS(LS_POS, JSON.stringify(current))
+              return current
+            })
+          }
+        }
+        window.addEventListener('mousemove', onMove)
+        window.addEventListener('mouseup', onUp)
+        return function () {
+          window.removeEventListener('mousemove', onMove)
+          window.removeEventListener('mouseup', onUp)
+          document.body.style.userSelect = ''
+        }
+      }, [])
+
+      /** 回到默认锚点（会话列表下方、页脚上方）。 */
+      function resetPosition() {
+        writeLS(LS_POS, '')
+        setPos(null)
+      }
+
+      // 拖过就用用户坐标，否则锚定在侧栏页脚上方（bottom 定位，高度自适应）。
+      var floatStyle = pos === null
+        ? { left: anchor.left + 'px', width: anchor.width + 'px', bottom: anchor.bottom + 'px' }
+        : { left: pos.left + 'px', width: anchor.width + 'px', top: pos.top + 'px' }
+
+      if (minimized) {
+        return jsx.jsxs('div', {
+          className: 'tm-pill',
+          style: { left: floatStyle.left, bottom: pos === null ? floatStyle.bottom : undefined, top: pos === null ? undefined : floatStyle.top },
+          role: 'button',
+          tabIndex: 0,
+          title: '展开 Token 用量监测',
+          onClick: toggleMinimized,
+          children: [
+            jsx.jsx(IconDataOutline16, { size: 14 }),
+            jsx.jsx('span', { className: 'tm-pill-total', children: fmtZh(totals.total) }),
+            jsx.jsx('span', { className: 'tm-pill-money', children: fmtMoney(totals.cost, currency) }),
+          ],
+        })
+      }
+
+      var floatNode = jsx.jsxs('div', {
+        className: 'tm-float',
+        style: floatStyle,
         children: [
           jsx.jsxs('div', {
-            className: 'tm-head',
+            className: 'tm-float-head',
+            onMouseDown: onHeadMouseDown,
+            onDoubleClick: onHeadDoubleClick,
+            title: '拖动可移动，双击回到默认位置',
             children: [
               jsx.jsx('div', {
                 className: 'tm-title',
@@ -531,24 +704,32 @@ window.__ModuleLoader__.load({
                   children: modelName,
                 }),
               }),
-              jsx.jsxs('div', {
+              jsx.jsx('div', {
                 className: 'tm-head-actions',
                 children: [
                   state.status === 'stale'
                     ? jsx.jsx('span', { className: 'tm-error', title: errorMessage, children: '离线' })
                     : null,
                   jsx.jsx('button', {
-                    type: 'button',
-                    className: 'tm-btn',
+                    type: 'button', className: 'tm-btn',
                     onClick: function () { setDialogOpen(true) },
                     title: '打开用量日志',
                     children: '日志',
+                  }),
+                  jsx.jsx('button', {
+                    type: 'button', className: 'tm-float-icon',
+                    onClick: toggleMinimized,
+                    title: '最小化',
+                    'aria-label': '最小化',
+                    children: '—',
                   }),
                 ],
               }),
             ],
           }),
-
+          jsx.jsxs('div', {
+            className: 'tm-float-body',
+            children: [
           jsx.jsxs('div', {
             className: 'tm-total',
             children: [
@@ -610,19 +791,27 @@ window.__ModuleLoader__.load({
             jsx.jsx('span', { children: '23:00' }),
           ] }),
 
-          jsx.jsx(Legend, { value: legendValue }),
+              jsx.jsx(Legend, { value: legendValue }),
 
-          jsx.jsx('div', {
-            className: 'tm-hint',
-            children: hoveredBucket === null
-              ? (state.status === 'loading' ? '正在读取会话日志…' : '悬停柱子看该小时明细')
-              : bucketFullLabel(hoveredBucket.key === undefined ? String(hoveredBucket.hour).padStart(2, '0') : hoveredBucket.key, 'hour')
-                + ' · 合计 ' + fmtFull(hoveredBucket.total),
+              jsx.jsx('div', {
+                className: 'tm-hint',
+                children: hoveredBucket === null
+                  ? (state.status === 'loading' ? '正在读取会话日志…' : '悬停柱子看该小时明细')
+                  : bucketFullLabel(hoveredBucket.key === undefined ? String(hoveredBucket.hour).padStart(2, '0') : hoveredBucket.key, 'hour')
+                    + ' · 合计 ' + fmtFull(hoveredBucket.total),
+              }),
+            ],
           }),
+        ],
+      })
 
-          dialogOpen
-            ? jsx.jsx(LogDialog, { onClose: function () { setDialogOpen(false) } })
-            : null,
+      // 弹窗是 body 级 portal，与浮窗并列返回（Fragment），保证它盖在浮窗之上。
+      // 用 React.Fragment（Element 2）而不是 jsx-runtime 的 Fragment 字符串：
+      // 前者是 {type: Symbol(react.fragment), props:{children}}，测试可以像展开普通组件一样展开它。
+      return jsx.jsxs(React.Fragment, {
+        children: [
+          floatNode,
+          dialogOpen ? jsx.jsx(LogDialog, { onClose: function () { setDialogOpen(false) } }) : null,
         ],
       })
     }
@@ -1092,17 +1281,20 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       ctx.effect(function () {
-        // 注册进 ui-sidebar 声明的 footer 槽位：设置按钮上方。
-        // 槽位是别的插件声明的，必须用 inject 等待其声明出现（而不是直接 register）。
-        return ctx.slots.inject('sidebar.footer.action', function () {
+        // 注册进 ui-layout 声明的 shell.overlay（全框浮层，list 槽位，可叠加）。
+        //
+        // 为什么不再用 sidebar.footer.action：那个位置已被其它插件占用（Cordis Plugin 区），
+        // 且侧栏底部要按『工作区 → 会话列表 → 本插件 → 页脚』的次序排，
+        // 而 footer 槽位只能表达『页脚内的一行』，无法落在会话列表与页脚之间。
+        // overlay 层是 pointer-events:none + 直接子元素 auto，正好做浮窗。
+        return ctx.slots.inject('shell.overlay', function () {
           return ctx.slots.register({
-            name: 'sidebar.footer.action',
+            name: 'shell.overlay',
             id: 'token-monitor',
-            // order 越大越靠近设置按钮（footer 动作按 order 升序渲染，设置按钮在动作区下方）。
-            order: 100,
+            order: 90,
           }, TokenMonitorWidget)
         })
-      }, 'token-monitor: sidebar widget')
+      }, 'token-monitor: floating window')
     }
 
     exports.apply = apply
@@ -1118,6 +1310,11 @@ window.__ModuleLoader__.load({
       fmtAgo: fmtAgo,
       fmtMoney: fmtMoney,
       bandOf: bandOf,
+      measureAnchor: measureAnchor,
+      readLS: readLS,
+      writeLS: writeLS,
+      LS_MIN: LS_MIN,
+      LS_POS: LS_POS,
       PeakBand: PeakBand,
       shanghaiToday: shanghaiToday,
       shiftDateString: shiftDateString,
