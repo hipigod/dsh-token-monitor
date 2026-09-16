@@ -33,6 +33,12 @@ window.__ModuleLoader__.load({
 
     // ───────────────────────── 常量 ─────────────────────────
 
+    /**
+     * 包名。它是四个东西的同一个值，任何一处不一致都会出事故（详见 README「已修缺陷」）：
+     * 模块表行 id = `__ModuleLoader__.load({id})` = `<style data-plugin>` 的归属者 = HMR 的 entry id。
+     */
+    var PLUGIN_ID = '@local/dsh-token-monitor'
+
     var API_OVERVIEW = '/plugin-api/token-monitor/overview'
     var API_LOG = '/plugin-api/token-monitor/log'
     /** 小窗口自动刷新间隔（宿主侧扫描有 (mtime,size) 缓存，这个频率不会造成重复解码）。 */
@@ -206,13 +212,66 @@ window.__ModuleLoader__.load({
       '.tm-mini{display:inline-flex;gap:2px;align-items:center}',
     ].join('\n')
 
+    /**
+     * 注入本插件的皮肤。
+     *
+     * ⚠ 必须同时写 `data-plugin`（= 包名）与 `data-plugin-css`（去重键）。原因是 DSH 的
+     * client-modules 在**每个模块 materialize 时**都会跑 claimStyles(id)，把文档里所有
+     * `style:not([data-plugin])` 的样式表认领给那个模块（packages/client/modules/src/client/
+     * system.ts 的 claimStyles）；随后 client-hmr 重建那个模块时会跑 removeOwnedStyles(id)，
+     * 把「属于它的」样式表一起删掉（packages/client/hmr/src/client/index.ts）。
+     *
+     * 只写 data-plugin-css 的后果（2026-09-16 用户截图实证）：这张表先被别的模块 claim 走，
+     * 再随它的 HMR 重建被删 —— 本插件的 fiber 毫发无伤、React 树照常渲染，但 CSS 没了，
+     * 浮窗退化成无样式 div 落进 shell.overlay 的正常流（左上角 0,0），压住侧栏的会话列表，
+     * 只有「打开日志再关掉」这种偶然路径才会重新注入。
+     *
+     * 官方注入器（packages/client/tsdown.client.ts 的 styleInjectionModule）就是同时打这两个
+     * 属性，这里对齐它：这张表只归本插件所有，别人 claim 不走；我们自己的 HMR 重建会连它
+     * 一起正确回收，再由 apply() 重新注入。
+     */
     function ensureStyle() {
-      if (typeof document === 'undefined') return
-      if (document.querySelector('style[data-plugin-css="' + CSS_TAG + '"]') !== null) return
+      if (typeof document === 'undefined' || document.head === null || document.head === undefined) return
+      var existing = document.querySelector('style[data-plugin-css="' + CSS_TAG + '"]')
+      if (existing !== null) {
+        // 表在，但归属未必是本插件：修复前注入的那张（只写了 data-plugin-css）早已被别的模块
+        // 的 claimStyles 认领走。认领/回收的账本是「按 data-plugin 属性逐字比对」的
+        // （removeOwnedStyles），所以把归属抢回来就等于替那张表销掉别人的账 —— 那个模块
+        // 之后再重建，也不会连坐删掉我们的皮肤。只按 data-plugin-css 去重、不看归属，
+        // 会让页面长期停在「皮肤是别人的」这个中间态上。
+        if (existing.getAttribute('data-plugin') !== PLUGIN_ID) existing.setAttribute('data-plugin', PLUGIN_ID)
+        // 只清内容、不删节点同样是「皮肤没了」（外部清理脚本、误操作），补回内容。
+        if (existing.textContent === '') existing.textContent = CSS
+        return
+      }
       var tag = document.createElement('style')
+      tag.setAttribute('data-plugin', PLUGIN_ID)
       tag.setAttribute('data-plugin-css', CSS_TAG)
       tag.textContent = CSS
       document.head.appendChild(tag)
+    }
+
+    /**
+     * 样式自愈：这张表一旦消失（HMR 记账误删、别的代码清理 head、用户脚本等），必须立刻补回。
+     * 不补的后果就是上面的故障形态——浮窗长期停成无样式 div，用户得手动开关一次日志弹窗。
+     *
+     * 观察 document.head 的 childList：删除动作本身触发一次微任务回调，补回后不再产生新变更，
+     * 因此不会自激循环。返回的观察器交给调用方 disconnect（随 fiber 一起回收）。
+     *
+     * head 还不存在时退一步观察 documentElement：head 被插进来时 childList 回调会再跑一次
+     * ensureStyle 把皮肤补上；否则 apply 这一跑没注入成，就再没有任何东西会重试。
+     *
+     * @returns {MutationObserver|null} 观察器；环境不支持时为 null
+     */
+    function watchStyle() {
+      if (typeof MutationObserver !== 'function') return null
+      if (typeof document === 'undefined') return null
+      var head = document.head
+      var target = (head === null || head === undefined) ? document.documentElement : head
+      if (target === null || target === undefined) return null
+      var observer = new MutationObserver(function () { ensureStyle() })
+      observer.observe(target, { childList: true })
+      return observer
     }
 
     // ───────────────────────── 工具 ─────────────────────────
@@ -294,16 +353,46 @@ window.__ModuleLoader__.load({
       return ((hour >= 9 && hour < 12) || (hour >= 14 && hour < 18)) ? 2 : 1
     }
 
+    /**
+     * 上海当日 00:00 对应的 UTC 毫秒。峰谷带要按「今天第 i 个小时」上色，就得知道今天从哪一刻起。
+     * @param {number} ms 当前时刻（UTC 毫秒）
+     * @returns {number} 当日 00:00（上海）的 UTC 毫秒
+     */
+    function shanghaiDayStartMs(ms) {
+      var local = new Date(ms + 8 * 3600000)
+      return Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) - 8 * 3600000
+    }
+
+    /**
+     * 桶 key → 该桶**自己那个时段**的峰谷判定。
+     * key 是上海本地时刻串（'2026-09-17T09' 小时桶 / '2026-09-17' 天桶），
+     * 先还原成真实 UTC 瞬时（-8h）再交给 bandOf（内部再 +8h）。
+     * @param {string} key 桶 key
+     * @returns {0|1|2} 0=解析不出（未知）
+     */
+    function bandOfKey(key) {
+      if (typeof key !== 'string') return 0
+      var m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}))?/.exec(key)
+      if (m === null) return 0
+      var ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), m[4] === undefined ? 0 : Number(m[4]))
+      return bandOf(ms - 8 * 3600000)
+    }
+
     /** 峰谷时段带：直方图上方一条 24 格色带，回答"哪个时段贵"。 */
     function PeakBand(props) {
       var buckets = props.buckets || []
       var hours = props.hours || 24
+      var dayStart = shanghaiDayStartMs(Date.now())
       var cells = []
       for (var i = 0; i < hours; i += 1) {
         var bucket = buckets[i]
-        var band = bucket && typeof bucket.band === 'number' && bucket.band > 0
-          ? bucket.band
-          : bandOf(Date.now())
+        var band = bucket && typeof bucket.band === 'number' && bucket.band > 0 ? bucket.band : 0
+        // 没有用量的小时（含「今天还没到的小时」）宿主给的 band 是 0，必须按**这一格自己那个小时**
+        // 判定：先看桶 key，再看「今天第 i 个小时」。
+        // 旧写法对空格子一律用 bandOf(Date.now()) —— 跨零点后整条带都按"当前小时"上色，
+        // 9:00–12:00 的高峰会被涂成空闲（e2e 在 00:55 抓到：峰 0 谷 24）。
+        if (band === 0) band = bandOfKey(bucket && bucket.key)
+        if (band === 0) band = bandOf(dayStart + i * 3600000)
         cells.push(jsx.jsx('div', {
           className: 'tm-band-cell',
           'data-band': band,
@@ -666,14 +755,25 @@ window.__ModuleLoader__.load({
       }
 
       // 拖过就用用户坐标，否则锚定在侧栏页脚上方（bottom 定位，高度自适应）。
+      //
+      // position/z-index 也走 inline，而不是只靠注入的 CSS：样式表万一缺失（注入失败、
+      // 被外部清理），fixed 定位仍然成立，浮窗最坏只是「没皮肤」，绝不会掉进 shell.overlay
+      // 的正常流去压住侧栏会话列表（那正是用户截图里的故障形态）。
+      var PIN = { position: 'fixed', zIndex: 30 }
       var floatStyle = pos === null
-        ? { left: anchor.left + 'px', width: anchor.width + 'px', bottom: anchor.bottom + 'px' }
-        : { left: pos.left + 'px', width: anchor.width + 'px', top: pos.top + 'px' }
+        ? { position: PIN.position, zIndex: PIN.zIndex, left: anchor.left + 'px', width: anchor.width + 'px', bottom: anchor.bottom + 'px' }
+        : { position: PIN.position, zIndex: PIN.zIndex, left: pos.left + 'px', width: anchor.width + 'px', top: pos.top + 'px' }
 
       if (minimized) {
         return jsx.jsxs('div', {
           className: 'tm-pill',
-          style: { left: floatStyle.left, bottom: pos === null ? floatStyle.bottom : undefined, top: pos === null ? undefined : floatStyle.top },
+          style: {
+            position: PIN.position,
+            zIndex: PIN.zIndex,
+            left: floatStyle.left,
+            bottom: pos === null ? floatStyle.bottom : undefined,
+            top: pos === null ? undefined : floatStyle.top,
+          },
           role: 'button',
           tabIndex: 0,
           title: '展开 Token 用量监测',
@@ -1280,6 +1380,14 @@ window.__ModuleLoader__.load({
     var inject = ['slots']
 
     function apply(ctx) {
+      // 皮肤先落地：apply 一跑就有样式，不等任何一次 React 挂载；同时挂上自愈观察器，
+      // 让样式表在运行期被任何外力删除后都能立刻回来（用户遇到的就是「被删了没人补」）。
+      ctx.effect(function () {
+        ensureStyle()
+        var observer = watchStyle()
+        return function () { if (observer !== null) observer.disconnect() }
+      }, 'token-monitor: skin stylesheet')
+
       ctx.effect(function () {
         // 注册进 ui-layout 声明的 shell.overlay（全框浮层，list 槽位，可叠加）。
         //
@@ -1301,6 +1409,10 @@ window.__ModuleLoader__.load({
     exports.inject = inject
     // 供无头测试使用（不参与宿主加载路径）
     exports.__internals = {
+      PLUGIN_ID: PLUGIN_ID,
+      CSS_TAG: CSS_TAG,
+      ensureStyle: ensureStyle,
+      watchStyle: watchStyle,
       fmtCompact: fmtCompact,
       fmtZh: fmtZh,
       fmtFull: fmtFull,
@@ -1310,6 +1422,8 @@ window.__ModuleLoader__.load({
       fmtAgo: fmtAgo,
       fmtMoney: fmtMoney,
       bandOf: bandOf,
+      bandOfKey: bandOfKey,
+      shanghaiDayStartMs: shanghaiDayStartMs,
       measureAnchor: measureAnchor,
       readLS: readLS,
       writeLS: writeLS,

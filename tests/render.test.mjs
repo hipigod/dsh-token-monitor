@@ -144,6 +144,22 @@ t('style 来自实时测量的锚点（侧栏 left/宽 + 页脚上方 bottom）'
   // 视口 900，页脚 top=700 → bottom = 900-700+8 = 208
   assert.equal(st.bottom, '208px', 'bottom 应落在页脚上方 8px')
 })
+t('定位走 inline（样式表缺失时浮窗也不会掉进 overlay 正常流压住侧栏）', () => {
+  const st = tree.props.style
+  assert.equal(st.position, 'fixed', 'inline position 必须为 fixed，不能只靠注入的 CSS')
+  assert.equal(st.zIndex, 30, 'z-index 也要 inline，保证在 overlay 层内的层序')
+})
+t('最小化胶囊同样带 inline 定位', () => {
+  hooks.cursor = 0
+  hooks.inject = {}
+  const realLS = global.window.localStorage
+  global.window.localStorage = { getItem: () => '1', setItem() {}, removeItem() {} }
+  const pill = TokenMonitorWidget({})
+  global.window.localStorage = realLS
+  assert.equal(pill.props.className, 'tm-pill')
+  assert.equal(pill.props.style.position, 'fixed', '胶囊也必须 inline 定位')
+  assert.equal(pill.props.style.zIndex, 30)
+})
 t('头部含拖动区，右上角有【日志】与【最小化】', () => {
   const head = walk(tree).find(n => n.props && n.props.className === 'tm-float-head')
   assert.ok(head, '缺少浮窗头部')

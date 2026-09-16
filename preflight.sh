@@ -40,6 +40,11 @@ mark "className: 'tm-float'" "浮窗外壳"
 mark "'最小化'" "最小化按钮"
 mark "onMouseDown: onHeadMouseDown" "拖动处理器"
 mark '@local/dsh-token-monitor' "注册 id"
+# 缺陷 8 的三条契约：皮肤归属、归属回收、运行期自愈。少任何一条，浮窗都会在
+# 某次与它无关的 HMR 重建之后变成无皮肤的裸 div（用户实测的故障形态）。
+mark "existing.setAttribute('data-plugin', PLUGIN_ID)" "皮肤归属回收"
+mark "function watchStyle()" "皮肤自愈观察器"
+mark "position: 'fixed'" "浮窗 inline 定位兜底"
 if [ -z "$MISSING" ]; then
   ok "关键代码块齐备"
 else

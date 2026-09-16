@@ -72,6 +72,45 @@ t('坏 key 不炸', () => {
   assert.equal(i.bucketFullLabel('garbage', 'hour'), 'garbage')
 })
 
+console.log('== 峰谷时段带（缺陷 9：没有用量的格子不能用「当前小时」上色）==')
+t('bandOf：周一至周五 9–12 / 14–18 为高峰，周末全天空闲', () => {
+  // 2026-09-17 是周四，2026-09-19 是周六；入参是 UTC 瞬时，所以上海本地 09:00 = UTC 01:00。
+  assert.equal(i.bandOf(Date.UTC(2026, 8, 17, 9) - 8 * 3600000), 2)
+  assert.equal(i.bandOf(Date.UTC(2026, 8, 17, 12) - 8 * 3600000), 1, '12:00 已过上午高峰')
+  assert.equal(i.bandOf(Date.UTC(2026, 8, 17, 14) - 8 * 3600000), 2)
+  assert.equal(i.bandOf(Date.UTC(2026, 8, 17, 18) - 8 * 3600000), 1, '18:00 已过下午高峰')
+  assert.equal(i.bandOf(Date.UTC(2026, 8, 19, 10) - 8 * 3600000), 1, '周六应为空闲')
+})
+t('bandOfKey：按桶自己那个小时判定，解析不出返回 0', () => {
+  assert.equal(i.bandOfKey('2026-09-17T09'), 2)
+  assert.equal(i.bandOfKey('2026-09-17T00'), 1)
+  assert.equal(i.bandOfKey('2026-09-17T17'), 2)
+  assert.equal(i.bandOfKey('2026-09-19T10'), 1, '周六')
+  assert.equal(i.bandOfKey('2026-09-17'), 1, '天桶兜底为浅色')
+  assert.equal(i.bandOfKey('garbage'), 0)
+  assert.equal(i.bandOfKey(undefined), 0)
+})
+t('峰谷带：没用量的小时按「那一格自己那个小时」上色（金标准向量，与运行时刻无关）', () => {
+  const buckets = Array.from({ length: 24 }, (_, h) => ({ key: `2026-09-17T${String(h).padStart(2, '0')}`, band: 0 }))
+  const tree = i.PeakBand({ buckets, hours: 24 })
+  const cells = tree[1].children
+  assert.equal(cells.length, 24)
+  const bands = cells.map((cell) => cell[1]['data-band'])
+  const expected = Array.from({ length: 24 }, (_, h) => (((h >= 9 && h < 12) || (h >= 14 && h < 18)) ? 2 : 1))
+  assert.deepEqual(bands, expected, '旧实现用 Date.now()，跑在非高峰时刻会把整条带涂成同一色')
+})
+t('峰谷带：连 key 都没有时退到「今天第 i 个小时」', () => {
+  const tree = i.PeakBand({ buckets: [], hours: 24 })
+  const bands = tree[1].children.map((cell) => cell[1]['data-band'])
+  const dayStart = i.shanghaiDayStartMs(Date.now())
+  const expected = Array.from({ length: 24 }, (_, h) => i.bandOf(dayStart + h * 3600000))
+  assert.deepEqual(bands, expected)
+})
+t('shanghaiDayStartMs：上海当日零点（naive UTC+8 的日界）', () => {
+  // 2026-09-17 07:30 上海 = 2026-09-16 23:30 UTC → 当日零点应是 2026-09-16 16:00 UTC
+  assert.equal(i.shanghaiDayStartMs(Date.UTC(2026, 8, 16, 23, 30)), Date.UTC(2026, 8, 16, 16, 0))
+})
+
 console.log('== 日期工具（上海口径） ==')
 t('shanghaiToday 用宿主给的偏移', () => {
   assert.equal(i.shanghaiToday(480), new Date(Date.now() + 480 * 60000).toISOString().slice(0, 10))
@@ -104,6 +143,111 @@ t('注册 id 必须等于包名（不等于包名 → 浏览器 boot 直接抛 "
 t('API 路径与宿主一致', () => {
   assert.equal(i.API_OVERVIEW, '/plugin-api/token-monitor/overview')
   assert.equal(i.API_LOG, '/plugin-api/token-monitor/log')
+})
+t('皮肤样式表声明 data-plugin 归属（不写就会被别的模块 claimStyles 认领，再随它的 HMR 重建被删掉）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const declared = JSON.parse(readFileSync(join(PKG, 'package.json'), 'utf8')).name
+  assert.equal(i.PLUGIN_ID, declared, 'PLUGIN_ID 必须是包名')
+  assert.equal(i.PLUGIN_ID, global.__reg.id, 'PLUGIN_ID 与注册 id 必须同一个值')
+  // 假节点：属性表 + 文本内容，够 ensureStyle 做「归属核对 / 内容核对」。
+  const nodes = []
+  const realDocument = global.document
+  global.document = {
+    head: { appendChild: (node) => { nodes.push(node) } },
+    createElement: () => ({
+      attrs: {},
+      textContent: '',
+      setAttribute(k, v) { this.attrs[k] = v },
+      getAttribute(k) { return k in this.attrs ? this.attrs[k] : null },
+    }),
+    querySelector: () => (nodes.length === 0 ? null : nodes[0]),
+  }
+  try {
+    i.ensureStyle()
+    assert.equal(nodes.length, 1, '应注入一张样式表')
+    const injected = nodes[0]
+    assert.equal(injected.getAttribute('data-plugin'), declared, 'data-plugin 必须是包名（client-modules 只认领 style:not([data-plugin])）')
+    assert.equal(injected.getAttribute('data-plugin-css'), i.CSS_TAG, 'data-plugin-css 是去重键')
+    i.ensureStyle()
+    assert.equal(nodes.length, 1, '已存在时不得重复注入（幂等）')
+    // 归属被别的模块 claim 走（预修复版本遗留在页面里的表 / 外部改写）→ 必须抢回来。
+    // 不抢的话，认领方一旦被 HMR 重建，removeOwnedStyles 会连坐删掉这张表 —— 就是用户实测的故障。
+    injected.setAttribute('data-plugin', '@deepseek-ai/dsh-client-ui-sidebar')
+    i.ensureStyle()
+    assert.equal(injected.getAttribute('data-plugin'), declared, '归属被改写后必须抢回')
+    assert.equal(nodes.length, 1, '抢回归属不得再注入一张（皮肤重复）')
+    // 只清内容不删节点 = 皮肤同样没了 → 补回内容
+    injected.textContent = ''
+    i.ensureStyle()
+    assert.ok(injected.textContent.length > 100, '内容被清空必须补回')
+  } finally {
+    if (realDocument === undefined) delete global.document
+    else global.document = realDocument
+  }
+})
+t('样式自愈：样式表被外部删除后被观察器补回', () => {
+  const realDocument = global.document
+  const realObserver = global.MutationObserver
+  let observed = null
+  let disconnected = false
+  let exists = false
+  global.document = {
+    head: { appendChild: () => { exists = true } },
+    createElement: () => ({ setAttribute() {}, getAttribute: () => null, textContent: 'x' }),
+    querySelector: () => (exists ? { setAttribute() {}, getAttribute: () => null, textContent: 'x' } : null),
+  }
+  global.MutationObserver = class {
+    constructor(fn) { this.callback = fn }
+    observe(node, options) { observed = { node, options } }
+    disconnect() { disconnected = true }
+  }
+  try {
+    const observer = i.watchStyle()
+    assert.ok(observer, '应返回观察器')
+    assert.equal(observed.node, global.document.head, '必须观察 document.head')
+    assert.equal(observed.options.childList, true, '必须观察 childList')
+    exists = false
+    observer.callback()
+    assert.equal(exists, true, '样式表被删后必须补回')
+    observer.disconnect()
+    assert.equal(disconnected, true, '必须能随 fiber 一起回收')
+  } finally {
+    if (realDocument === undefined) delete global.document
+    else global.document = realDocument
+    if (realObserver === undefined) delete global.MutationObserver
+    else global.MutationObserver = realObserver
+  }
+})
+t('head 尚未就绪时退一步观察 documentElement（head 出现后仍能补皮肤）', () => {
+  const realDocument = global.document
+  const realObserver = global.MutationObserver
+  let observed = null
+  global.document = { head: null, documentElement: { name: 'html' } }
+  global.MutationObserver = class {
+    constructor(fn) { this.callback = fn }
+    observe(node, options) { observed = { node, options } }
+    disconnect() {}
+  }
+  try {
+    const observer = i.watchStyle()
+    assert.ok(observer, 'head 缺失时也必须返回观察器（否则永远没人重试注入）')
+    assert.equal(observed.node, global.document.documentElement, '应退一步观察 documentElement')
+    assert.equal(observed.options.childList, true)
+  } finally {
+    if (realDocument === undefined) delete global.document
+    else global.document = realDocument
+    if (realObserver === undefined) delete global.MutationObserver
+    else global.MutationObserver = realObserver
+  }
+})
+t('没有 MutationObserver 的环境降级为只在 apply 时注入，不抛异常', () => {
+  const realObserver = global.MutationObserver
+  delete global.MutationObserver
+  try {
+    assert.equal(i.watchStyle(), null)
+  } finally {
+    if (realObserver !== undefined) global.MutationObserver = realObserver
+  }
 })
 t('apply/inject 形状正确（slots 依赖）', () => {
   assert.equal(typeof m.apply, 'function')

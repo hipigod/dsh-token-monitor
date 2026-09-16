@@ -100,6 +100,7 @@ const f = await page.evaluate(() => {
     bandCells: document.querySelectorAll('.tm-band-cell').length,
     bandPeak: document.querySelectorAll('.tm-band-cell[data-band="2"]').length,
     bandIdle: document.querySelectorAll('.tm-band-cell[data-band="1"]').length,
+    bandVector: [...document.querySelectorAll('.tm-band-cell')].map(n => Number(n.getAttribute('data-band'))),
     legend: [...document.querySelectorAll('.tm-legend-item')].map(n => n.innerText.replace(/\n/g, ' ')),
     axisLabels: [...document.querySelectorAll('.tm-axis span')].map(n => n.innerText),
     // 位置关系：会话列表下方（不压住列表可见区）+ 页脚上方
@@ -132,14 +133,60 @@ ok('显示模型名 + 今日总量 + 花费 + 余额', () => {
   assert.ok(Number(cost) > 0, '今日花费应大于 0: ' + f.money[0])
   assert.ok(/高峰|空闲/.test(f.moneyTitle), '花费悬浮应给出峰谷分解: ' + f.moneyTitle)
 })
-ok('直方图 24 柱 + 峰谷带 24 格且峰谷都有', () => {
+ok('直方图 24 柱 + 峰谷带 24 格，每格按「那一格自己那个小时」上色', () => {
   assert.equal(f.barCount, 24, '实际 ' + f.barCount)
   assert.equal(f.bandCells, 24, '峰谷带实际 ' + f.bandCells)
-  assert.ok(f.bandPeak > 0 && f.bandIdle > 0, `峰谷应都有: 峰 ${f.bandPeak} 谷 ${f.bandIdle}`)
+  // 金标准独立算一遍（不复用插件代码）：北京时间周一至周五 9–12 / 14–18 为高峰。
+  // 旧实现把「没有用量的格子」一律按当前小时上色，跨零点后这条断言必挂（实测峰 0 谷 24）——
+  // 之前的写法只断言"峰谷都有"，在 20:55 跑是绿的，把这个缺陷放过去了。
+  const local = new Date(Date.now() + 8 * 3600000)
+  const weekend = local.getUTCDay() === 0 || local.getUTCDay() === 6
+  const expected = Array.from({ length: 24 }, (_, h) => (weekend ? 1 : (((h >= 9 && h < 12) || (h >= 14 && h < 18)) ? 2 : 1)))
+  assert.deepEqual(f.bandVector, expected, `峰谷带与实际时段不符: ${JSON.stringify(f.bandVector)}`)
 })
 ok('三桶图例齐备 + 轴标注', () => {
   assert.equal(f.legend.length, 3, JSON.stringify(f.legend))
   assert.deepEqual(f.axisLabels, ['00:00', '12:00', '23:00'])
+})
+
+console.log('== 皮肤归属与自愈（用户实测故障的回归：样式表没了 → 浮窗掉到侧栏左上角）==')
+const skin = await page.evaluate(() => {
+  const tag = document.querySelector('style[data-plugin-css="dsh-token-monitor/skin.css"]')
+  return { exists: tag !== null, owner: tag === null ? null : tag.getAttribute('data-plugin') }
+})
+ok('皮肤样式表存在，且声明了 data-plugin 归属', () => {
+  assert.equal(skin.exists, true, '找不到皮肤样式表 —— 浮窗会以无样式形态出现')
+  assert.equal(skin.owner, '@local/dsh-token-monitor',
+    'data-plugin 必须是本插件包名。不写的话，client-modules 的 claimStyles 会把它认领给下一个 materialize 的模块，'
+    + '再随那个模块的 HMR 重建被 removeOwnedStyles 删掉。实际: ' + skin.owner)
+})
+const healed = await page.evaluate(async () => {
+  const sel = 'style[data-plugin-css="dsh-token-monitor/skin.css"]'
+  const rect = (node) => { const r = node.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y) } }
+  const before = rect(document.querySelector('.tm-float'))
+  const tag = document.querySelector(sel)
+  if (tag !== null) tag.remove()          // 与 client-hmr 的 removeOwnedStyles(id) 等价
+  const gonePosition = getComputedStyle(document.querySelector('.tm-float')).position
+  await new Promise((resolve) => { setTimeout(resolve, 400) })
+  const back = document.querySelector(sel)
+  const after = rect(document.querySelector('.tm-float'))
+  return {
+    before, after, gonePosition, back: back !== null,
+    backOwner: back === null ? null : back.getAttribute('data-plugin'),
+    position: getComputedStyle(document.querySelector('.tm-float')).position,
+  }
+})
+ok('样式表被删除后自动补回（不再需要用户手动开关一次日志弹窗）', () => {
+  assert.equal(healed.back, true, '样式表被删后没有自愈 —— 浮窗会长期停成无样式 div，压住侧栏会话列表')
+  assert.equal(healed.backOwner, '@local/dsh-token-monitor', '补回的样式表同样要有归属，实际: ' + healed.backOwner)
+})
+ok('样式表缺失期间浮窗不回落（inline position:fixed 兜底）', () => {
+  assert.equal(healed.gonePosition, 'fixed', '样式表缺失时浮窗掉出了 fixed 定位（就是用户截图里的「跑到侧栏顶上」）: ' + healed.gonePosition)
+  assert.equal(healed.position, 'fixed', '自愈后定位异常: ' + healed.position)
+})
+ok('自愈前后位置不跳', () => {
+  assert.ok(Math.abs(healed.after.y - healed.before.y) <= 2 && Math.abs(healed.after.x - healed.before.x) <= 2,
+    `位置跳了: ${JSON.stringify(healed.before)} → ${JSON.stringify(healed.after)}`)
 })
 
 console.log('== 浮窗：拖动与最小化 ==')
