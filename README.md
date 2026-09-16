@@ -257,6 +257,19 @@ node tests/e2e-browser.mjs "$TOKEN"   # 16 项：无头 Chromium 打开真 GUI�
 curl -s http://127.0.0.1:3080/plugin-api/token-monitor/doctor | jq
 ```
 
+## 八点五、本机部署位置（这台机器上的实际情况）
+
+| 路径 | 是什么 |
+|---|---|
+| `/root/apps/dsh-plugin-token-monitor/` | 插件源码。**不要搬**：profile 以 `link:` 依赖它，搬走会让整个 GUI 不挂载 |
+| `/root/dsh-workspace/dsh-token-monitor-workspace/` | 开发这一轮的工作区（笔记、截图、截图脚本，`source` 符号链接指向源码） |
+| `/root/archive/dsh-token-monitor-backups/` | 好版本快照与事故版本备份 |
+| `/root/archive/profile-web-backup-20260915-163321/` | 安装插件前的 web profile 备份（整体回滚用） |
+| https://github.com/hipigod/dsh-token-monitor | 已推送的公开仓库 |
+
+那轮对话的完整记录（实现细节、两个事故的复盘、恢复手册）在这个工作区的
+`notes/token-monitor-plugin.md`。
+
 ## 九、实现要点（为什么这么做）
 
 - **zstd 多帧**：DSH 的会话日志是**多帧拼接**的 zstd 流，每帧 ~1.8KB（实测 1.38MB / 750 帧）。`zlib.zstdDecompressSync(buffer)` 只解第一帧——会得到「1 行日志」；流式解压器则在第二帧边界报 `Unknown frame descriptor`。因此按帧魔数切分、逐帧解码，并给解码器加 `finishFlush: Z_SYNC_FLUSH`：不加的话，一个只有帧头的坏数据会**静默返回空缓冲**，伪装成「这个会话没有用量」。
