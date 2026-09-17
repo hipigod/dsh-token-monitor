@@ -1,6 +1,6 @@
 # dsh-token-monitor · 模型 Token 用量监测
 
-DSH（DeepSeek Harness）Web 插件。在**左侧边栏底部、设置按钮正上方**放一个小窗口，显示当前模型的**当日 token 总量**和**每小时直方图**（输入命中缓存 / 输入未命中缓存 / 输出），右侧一个【日志】按钮打开完整的用量报告弹窗。
+DSH（DeepSeek Harness）Web 插件。在**左侧边栏「会话列表下方、页脚（设置按钮）上方」**放一个可拖动、可最小化的浮窗，显示当前模型的**当日 token 总量**和**每小时直方图**（输入命中缓存 / 输入未命中缓存 / 输出），右上角一个【日志】按钮打开完整的用量报告弹窗。
 
 数据**全部来自本机会话日志**（`$DSH_HOME/sessions/**/session.v3.jsonl.zstd`），不额外埋点、不改动 DSH 源码、不依赖任何第三方包。
 
@@ -243,14 +243,15 @@ bash /root/apps/dsh-plugin-token-monitor/preflight.sh     # 退出码 0 才允�
 ```bash
 # 从 GitHub 克隆下来后，直接在克隆目录里跑（测试不依赖绝对路径）
 git clone https://github.com/hipigod/dsh-token-monitor.git && cd dsh-token-monitor
-node tests/host.test.mjs          # 35 项：宿主纯逻辑 + 真实 HTTP 路由（自建 server，不依赖宿主）
+node tests/host.test.mjs          # 51 项：宿主纯逻辑 + 真实 HTTP 路由（自建 server，不依赖宿主）
 node tests/client.test.mjs        # 23 项：格式化/桶标签/峰谷判定/日期/注册契约与皮肤归属契约
-node tests/render.test.mjs        # 21 项：用假 React 直接调用组件函数，断言真实元素树
+node tests/render.test.mjs        # 27 项：用假 React 直接调用组件函数，断言真实元素树
 TOKEN=$(grep -oE 'token=[A-Za-z0-9_-]+' /var/log/dsh-web.log | tail -1)
 node tests/e2e-browser.mjs "$TOKEN"   # 32 项：无头 Chromium 打开真 GUI，断言真 DOM 几何
 ```
 
-第四层是**唯一能发现上面 4 个缺陷**的一层：前三层全绿的时候，界面上依然是空的。
+第四层是**唯一能发现其中大多数缺陷**的一层（1、3、5、6、7、8、9 都是它或下面的
+「真 HMR 回归」抓到的）：前三层全绿的时候，界面上依然是空的。
 `tests/e2e-browser.mjs` 直接断言「模型名与【日志】按钮的矩形不相交」「弹窗卡片宽度 > 900px」「内层不溢出卡片」这类几何事实，而不是截图给人看。
 
 ### 真 HMR 回归（缺陷 8 的机制级复现）

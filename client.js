@@ -1,9 +1,13 @@
 /**
  * 模型 Token 用量监测 · TOKEN MONITOR — Client half.
  *
- * 挂载点：侧边栏底部、设置按钮上方（`sidebar.footer.action`，list 槽位，与 ui-settings
- * 的 `sidebar.settings` 相邻，由 ui-sidebar 的 SidebarRoot 按「footerActions 在 settingsArea
- * 之上」渲染，因此本组件天然位于设置按钮上方）。
+ * 挂载点：`shell.overlay`（ui-layout 声明的全框浮层）里的一个**浮窗**，
+ * 位置由实时测量的锚点决定 —— 落在「侧边栏会话列表下方、页脚（设置按钮）上方」。
+ * 历史上曾注册在 `sidebar.footer.action`，但那个槽位只能表达「页脚内的一行」，
+ * 落不到会话列表与页脚之间，且位置会被其它插件占用（见 README 缺陷 6d）。
+ *
+ * 皮肤（`<style>`）必须带 `data-plugin` = 包名并自愈，否则会被别的模块 claimStyles
+ * 认领走、再随它的 HMR 重建被删掉，浮窗就会变成没皮肤的裸 div（见 README 缺陷 8）。
  *
  * 数据来源：宿主侧插件注册的两个命名路由
  *   GET /plugin-api/token-monitor/overview   今日总览（小窗口）
