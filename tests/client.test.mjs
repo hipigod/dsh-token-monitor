@@ -72,6 +72,54 @@ t('坏 key 不炸', () => {
   assert.equal(i.bucketFullLabel('garbage', 'hour'), 'garbage')
 })
 
+console.log('== 时间轴补齐（缺陷 10：近一周/近一月只画有记录的那几天）==')
+t('rangeKeys：天粒度逐日、小时粒度逐小时，非法/倒序/超长区间不展开', () => {
+  assert.deepEqual(i.rangeKeys('2026-09-17', '2026-09-19', 'day'), ['2026-09-17', '2026-09-18', '2026-09-19'])
+  assert.deepEqual(i.rangeKeys('2026-09-17', '2026-09-17', 'day'), ['2026-09-17'])
+  assert.equal(i.rangeKeys('2026-09-17', '2026-09-18', 'hour').length, 48)
+  assert.equal(i.rangeKeys('2026-09-17', '2026-09-18', 'hour')[47], '2026-09-18T23')
+  assert.deepEqual(i.rangeKeys('2026-09-19', '2026-09-17', 'day'), [], '倒序')
+  assert.deepEqual(i.rangeKeys('garbage', '2026-09-17', 'day'), [], '非法日期')
+  assert.deepEqual(i.rangeKeys(undefined, undefined, 'day'), [])
+  assert.deepEqual(i.rangeKeys('1970-01-01', '2026-09-17', 'day'), [], '跨年区间不展开')
+})
+t('fillBuckets：近一周把空白天补成 0 桶且严格升序', () => {
+  const sparse = [
+    { key: '2026-09-17', cr: 1, ci: 0, out: 0, total: 1, requests: 1 },
+    { key: '2026-09-19', cr: 2, ci: 0, out: 0, total: 2, requests: 1 },
+    { key: '2026-09-23', cr: 3, ci: 0, out: 0, total: 3, requests: 1 },
+  ]
+  const filled = i.fillBuckets(sparse, 'day', { start: '2026-09-17', end: '2026-09-23' })
+  assert.equal(filled.length, 7, '七天必须有七格（旧行为只有 3 格，中间的 09-20/21/22 消失）')
+  assert.deepEqual(filled.map(b => b.key),
+    ['2026-09-17', '2026-09-18', '2026-09-19', '2026-09-20', '2026-09-21', '2026-09-22', '2026-09-23'])
+  assert.deepEqual(filled.map(b => b.total), [1, 0, 2, 0, 0, 0, 3])
+  assert.equal(filled[0].requests, 1, '有量的桶必须原样保留')
+  assert.equal(filled[1].requests, 0)
+  assert.equal(filled[1].band, 0)
+})
+t('fillBuckets：乱序输入也会排成区间顺序', () => {
+  const filled = i.fillBuckets([
+    { key: '2026-09-19', total: 2 },
+    { key: '2026-09-17', total: 1 },
+  ], 'day', { start: '2026-09-17', end: '2026-09-19' })
+  assert.deepEqual(filled.map(b => b.key), ['2026-09-17', '2026-09-18', '2026-09-19'])
+  assert.deepEqual(filled.map(b => b.total), [1, 0, 2])
+})
+t('fillBuckets：区间缺失/非法/超长时原样返回（宁可稀疏，也不能撑爆图）', () => {
+  const sparse = [{ key: '2026-09-17', total: 1 }]
+  assert.equal(i.fillBuckets(sparse, 'day', null), sparse)
+  assert.equal(i.fillBuckets(sparse, 'day', {}), sparse)
+  assert.equal(i.fillBuckets(sparse, 'day', { start: '1970-01-01', end: '2026-09-17' }), sparse)
+})
+t('fillBuckets：空 buckets 也能补出整段区间（整天无用量）', () => {
+  const filled = i.fillBuckets([], 'hour', { start: '2026-09-17', end: '2026-09-17' })
+  assert.equal(filled.length, 24)
+  assert.equal(filled[0].key, '2026-09-17T00')
+  assert.equal(filled[23].key, '2026-09-17T23')
+  assert.ok(filled.every(b => b.total === 0 && b.cr === 0 && b.band === 0 && b.peak === false))
+})
+
 console.log('== 峰谷时段带（缺陷 9：没有用量的格子不能用「当前小时」上色）==')
 t('bandOf：周一至周五 9–12 / 14–18 为高峰，周末全天空闲', () => {
   // 2026-09-17 是周四，2026-09-19 是周六；入参是 UTC 瞬时，所以上海本地 09:00 = UTC 01:00。

@@ -326,6 +326,41 @@ ok('表格有花费列', () => {
 })
 ok('写明时区口径', () => assert.ok(d.text.includes('Asia/Shanghai') || d.text.includes('上海时区')))
 
+console.log('== 时间轴连续性：近一周/近一月必须逐日占位（用户反馈：只画有记录的那几天）==')
+/** 上海口径的区间与逐日 key（独立于插件实现，金标准）。 */
+const goldenRange = (period) => {
+  const shift = (date, days) => new Date(Date.parse(date + 'T00:00:00Z') + days * 86400000).toISOString().slice(0, 10)
+  const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10)
+  const start = shift(today, period === 'week' ? -6 : -29)
+  const keys = []
+  for (let cursor = start; cursor <= today; cursor = shift(cursor, 1)) keys.push(cursor)
+  return keys
+}
+const clickPeriod = async (label) => {
+  await page.evaluate((text) => {
+    const btn = [...document.querySelectorAll('[role="dialog"] button')].find(b => b.innerText.trim() === text)
+    if (btn === undefined) throw new Error('找不到区间按钮: ' + text)
+    btn.click()
+  }, label)
+  await page.waitForTimeout(3000)
+}
+const readAxis = () => page.evaluate(() => ({
+  cols: document.querySelectorAll('.tm-hist-col').length,
+  // 柱子的悬浮提示以日期开头（bucketFullLabel），正好当 key 用
+  keys: [...document.querySelectorAll('.tm-hist-col')].map(c => (String(c.title).match(/^\d{4}-\d{2}-\d{2}(T\d{2})?/) || [''])[0]),
+  emptyCols: document.querySelectorAll('.tm-hist-col .tm-bar-empty').length,
+}))
+for (const [label, period] of [['近一周', 'week'], ['近一月', 'month']]) {
+  await clickPeriod(label)
+  const a = await readAxis()
+  const want = goldenRange(period)
+  console.log(`  ${label}实测: 柱子 ${a.cols} 根 / 其中空档 ${a.emptyCols} 根 / 期望 ${want.length} 根`)
+  ok(`${label}：柱子数等于区间天数，且逐日连续（空白天占位而不是消失）`, () => {
+    assert.equal(a.cols, want.length, `${label} 应有 ${want.length} 根柱子，实际 ${a.cols} —— 空档被吞掉了`)
+    assert.deepEqual(a.keys, want, `${label} 的柱子日期必须逐日连续`)
+  })
+}
+
 // 再硬刷新一次：等价于用户按 F5（本次事故里用户就是在刷新时发现问题）
 console.log('== 硬刷新后仍然正常 ==')
 await page.reload({ waitUntil: 'domcontentloaded', timeout: 40000 })

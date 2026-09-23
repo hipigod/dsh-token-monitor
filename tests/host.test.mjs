@@ -12,7 +12,7 @@ const mod = await import(`file://${join(PKG, 'index.js')}`)
 
 const {
   shanghaiParts, shanghaiDate, shanghaiDayStart, shiftDate,
-  decodeSessionLog, foldSessionLog, hourlyBuckets, timeBuckets, aggregate, resolveRange,
+  decodeSessionLog, foldSessionLog, hourlyBuckets, timeBuckets, bucketKeys, aggregate, resolveRange,
   isPeakHour, rateFor, costOf, costBreakdown, resolveApiKey,
 } = mod
 
@@ -241,12 +241,49 @@ t('分桶带上峰谷标记：小时桶 peak/band 正确，天桶不做峰谷断
 
 console.log('== 分桶/聚合 ==')
 const rec = (t, model, cr, ci, out) => ({ t, model, cr, ci, out })
-t('timeBuckets(day) 只产出有数据的天', () => {
+t('timeBuckets(day) 不传 range 时保持稀疏（向后兼容）', () => {
   const b = timeBuckets([rec(Date.parse('2026-09-15T01:00:00Z'), 'm', 1, 1, 1),
     rec(Date.parse('2026-09-17T01:00:00Z'), 'm', 2, 2, 2)], 'day')
   assert.deepEqual(b.map(x => x.key), ['2026-09-15', '2026-09-17'])
   assert.equal(b[0].total, 3)
   assert.equal(b[1].total, 6)
+})
+t('timeBuckets(day) 传 range 时空档占位（用户反馈：近一周/近一月只画有记录的那几天）', () => {
+  const b = timeBuckets([rec(Date.parse('2026-09-15T01:00:00Z'), 'm', 1, 1, 1),
+    rec(Date.parse('2026-09-17T01:00:00Z'), 'm', 2, 2, 2)], 'day', null,
+  { start: '2026-09-14', end: '2026-09-18' })
+  assert.deepEqual(b.map(x => x.key), ['2026-09-14', '2026-09-15', '2026-09-16', '2026-09-17', '2026-09-18'])
+  assert.deepEqual(b.map(x => x.total), [0, 3, 0, 6, 0], '中间空档必须是 0 桶而不是消失')
+  assert.deepEqual(b.map(x => x.requests), [0, 1, 0, 1, 0])
+  assert.deepEqual(b.map(x => x.band), [0, 0, 0, 0, 0], '无价目表时 band 全 0')
+})
+t('timeBuckets(hour) 传 range 时铺满 48 格（跨日）', () => {
+  const b = timeBuckets([rec(Date.parse('2026-09-15T16:00:00Z'), 'm', 1, 0, 0)], 'hour', null,
+  { start: '2026-09-16', end: '2026-09-17' })
+  assert.equal(b.length, 48)
+  assert.equal(b[0].key, '2026-09-16T00')
+  assert.equal(b[47].key, '2026-09-17T23')
+  assert.equal(b[0].total, 1, '北京 09-16 00:00 那条记录应落在第一格')
+  assert.equal(b[1].total, 0)
+})
+t('timeBuckets(day) + 价目表：空档 band=0、有量 band=1', () => {
+  const b = timeBuckets([rec(Date.parse('2026-09-15T01:00:00Z'), 'deepseek-flash', 1e6, 0, 0)], 'day', PRICING,
+    { start: '2026-09-14', end: '2026-09-16' })
+  assert.deepEqual(b.map(x => x.band), [0, 1, 0])
+  assert.ok(b[1].cost > 0, '有量那天应计价')
+  assert.equal(b[0].cost, 0)
+  assert.equal(b[0].peak, false)
+})
+t('bucketKeys：逐日/逐小时枚举 + 非法与超长区间不展开', () => {
+  assert.deepEqual(bucketKeys('2026-09-17', '2026-09-19', 'day'), ['2026-09-17', '2026-09-18', '2026-09-19'])
+  assert.deepEqual(bucketKeys('2026-09-17', '2026-09-17', 'day'), ['2026-09-17'])
+  assert.equal(bucketKeys('2026-09-17', '2026-09-18', 'hour').length, 48)
+  assert.equal(bucketKeys('2026-09-17', '2026-09-18', 'hour')[25], '2026-09-18T01')
+  assert.deepEqual(bucketKeys('2026-09-19', '2026-09-17', 'day'), [], '倒序不展开')
+  assert.deepEqual(bucketKeys('garbage', '2026-09-17', 'day'), [], '非法日期不展开')
+  assert.deepEqual(bucketKeys(undefined, undefined, 'day'), [])
+  assert.deepEqual(bucketKeys('1970-01-01', '2026-09-17', 'day'), [], '跨 56 年不展开（period=all 保持稀疏）')
+  assert.deepEqual(bucketKeys('2026-01-01', '2026-09-17', 'hour'), [], '小时粒度的 260 天不展开')
 })
 t('timeBuckets(hour) 按上海小时', () => {
   const b = timeBuckets([rec(Date.parse('2026-09-15T16:00:00Z'), 'm', 1, 0, 0)], 'hour')

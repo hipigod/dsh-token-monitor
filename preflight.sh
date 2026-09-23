@@ -45,6 +45,8 @@ mark '@local/dsh-token-monitor' "注册 id"
 mark "existing.setAttribute('data-plugin', PLUGIN_ID)" "皮肤归属回收"
 mark "function watchStyle()" "皮肤自愈观察器"
 mark "position: 'fixed'" "浮窗 inline 定位兜底"
+# 缺陷 10 的契约：时间轴必须按区间补齐空档（空白日期/小时占位），否则坐标轴把两天并成相邻。
+mark "function fillBuckets(" "时间轴按区间补齐"
 if [ -z "$MISSING" ]; then
   ok "关键代码块齐备"
 else

@@ -696,15 +696,59 @@ export function hourlyBuckets(records, date) {
 }
 
 /**
- * 按维度分桶（hour / day），日期范围自适应。
- * 桶数是有限集合（不是逐格遍历），所以近一个月也只是一天一根柱子。
+ * 区间内的**全部**桶 key（上海口径，升序）：天粒度逐日，小时粒度逐小时（每天 24 格）。
  *
- * @param {Array} records 记录
+ * 为什么不能只给"有记录的桶"：坐标轴是按数组顺序等距画的，缺格会把 09-19 与 09-22
+ * 画成相邻的两根柱子，看起来像"每天都在用"。空档本身是事实，必须占位。
+ *
+ * 防御：区间非法/倒序返回空；格数超过上限（自定义区间跨年、period=all 从 1970 起）
+ * 同样返回空 —— 调用方保持稀疏返回，宁可轴不连续，也不能吐上万条空桶。
+ *
+ * @param {string} start 起始日 YYYY-MM-DD（上海）
+ * @param {string} end 结束日 YYYY-MM-DD（上海，含当天）
  * @param {string} dim 'hour' | 'day'
+ * @returns {Array<string>} 桶 key 列表；不展开时为空数组
+ */
+export function bucketKeys(start, end, dim) {
+  if (typeof start !== 'string' || typeof end !== 'string') return []
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return []
+  const first = shanghaiDayStart(start)
+  const last = shanghaiDayStart(end)
+  if (Number.isNaN(first) || Number.isNaN(last) || last < first) return []
+  const days = Math.round((last - first) / DAY_MS) + 1
+  if (dim === 'hour' && days > 40) return []
+  if (dim !== 'hour' && days > 1000) return []
+  const keys = []
+  let cursor = start
+  for (let d = 0; d < days; d += 1) {
+    if (dim === 'hour') {
+      for (let hour = 0; hour < 24; hour += 1) keys.push(`${cursor}T${String(hour).padStart(2, '0')}`)
+    } else {
+      keys.push(cursor)
+    }
+    cursor = shiftDate(cursor, 1)
+  }
+  return keys
+}
+
+/**
+ * 按维度分桶（hour / day），日期范围自适应。
+ * 传了 range 就**先按区间铺满空格子**（空档占位），再把记录填进去。
+ *
+ * @param {Array} records 记录（已过滤到区间内）
+ * @param {string} dim 'hour' | 'day'
+ * @param {object|null} pricing 价目表
+ * @param {{start: string, end: string}|null} range 上海日期区间（含首尾）
  * @returns {Array<{key: string, label: string, ...totals}>} 按时间升序
  */
-export function timeBuckets(records, dim, pricing = null) {
+export function timeBuckets(records, dim, pricing = null, range = null) {
   const map = new Map()
+  // 先铺空格子：没有用量的小时/日期同样要占一格（band=0，客户端会自行判定峰谷上色）。
+  if (range !== null && typeof range === 'object') {
+    for (const key of bucketKeys(range.start, range.end, dim)) {
+      map.set(key, { key, label: key, ...emptyTotals(), cost: 0, band: 0, peak: false })
+    }
+  }
   for (const record of records) {
     const key = dim === 'hour' ? hourKey(record.t) : shanghaiDate(record.t)
     let bucket = map.get(key)
@@ -838,7 +882,7 @@ export function aggregate(sessions, range, view, pricing = null) {
     cost: money,
     currency: pricing === null ? null : pricing.currency,
     models: modelList,
-    buckets: timeBuckets(inRange, dim, pricing),
+    buckets: timeBuckets(inRange, dim, pricing, range),
     conversations: view === 'conversation' ? conversations : [],
     conversationCount: conversations.length,
     health: buildHealth(sessions.length, inRange, range, conversations),

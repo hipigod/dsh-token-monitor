@@ -343,6 +343,61 @@ window.__ModuleLoader__.load({
       return key + '（当日）'
     }
 
+    /** 空桶（区间内没有用量的那一格）。字段与宿主 timeBuckets 的空桶完全一致。 */
+    function emptyBucket(key) {
+      return { key: key, label: key, cr: 0, ci: 0, out: 0, total: 0, requests: 0, cost: 0, band: 0, peak: false }
+    }
+
+    /**
+     * 区间内的**全部**桶 key（上海口径，升序）：天粒度逐日，小时粒度逐小时（每天 24 格）。
+     * 区间非法、倒序，或格数超出上限（自定义区间跨年）时返回空数组 —— 调用方据此放弃补齐，
+     * 宁可稀疏，也不能为了补空档把上万条空桶塞进图里。
+     *
+     * @param {string} start YYYY-MM-DD（上海）
+     * @param {string} end YYYY-MM-DD（上海，含当天）
+     * @param {string} dim 'hour' | 'day'
+     * @returns {Array<string>} key 列表；无法补齐时为空
+     */
+    function rangeKeys(start, end, dim) {
+      if (typeof start !== 'string' || typeof end !== 'string') return []
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return []
+      if (end < start) return []
+      var dayLimit = dim === 'hour' ? 40 : 1000
+      var keys = []
+      var cursor = start
+      for (var i = 0; i < dayLimit && cursor <= end; i += 1) {
+        if (dim === 'hour') {
+          for (var hour = 0; hour < 24; hour += 1) keys.push(cursor + 'T' + String(hour).padStart(2, '0'))
+        } else {
+          keys.push(cursor)
+        }
+        cursor = shiftDateString(cursor, 1)
+      }
+      return cursor <= end ? [] : keys
+    }
+
+    /**
+     * 按区间补齐时间轴：缺的格子补成 0 桶（Histogram 对 0 桶画 2px 底线，
+     * 既保持等距节奏，又能一眼看出"这几天没用"）。
+     * 已有桶的顺序与内容原样保留；补齐后严格按区间升序排列。
+     */
+    function fillBuckets(buckets, dim, range) {
+      if (range === null || typeof range !== 'object') return buckets
+      var keys = rangeKeys(range.start, range.end, dim)
+      if (keys.length === 0) return buckets
+      var byKey = Object.create(null)
+      for (var i = 0; i < buckets.length; i += 1) {
+        var bucket = buckets[i]
+        if (bucket !== null && typeof bucket === 'object' && typeof bucket.key === 'string') byKey[bucket.key] = bucket
+      }
+      var list = []
+      for (var j = 0; j < keys.length; j += 1) {
+        var hit = byKey[keys[j]]
+        list.push(hit === undefined ? emptyBucket(keys[j]) : hit)
+      }
+      return list
+    }
+
     /**
      * 峰谷时段判定：与宿主 isPeakHour 同一规则（北京时间周一至周五 9–12、14–18）。
      * 这里再算一遍是为了给"未来小时"上色——那部分没有数据、宿主不会返回 band。
@@ -970,7 +1025,10 @@ window.__ModuleLoader__.load({
 
       var data = state.data
       var totals = (data && data.totals) || { cr: 0, ci: 0, out: 0, total: 0, requests: 0 }
-      var buckets = (data && data.buckets) || []
+      var dim = (data && data.dim) || 'hour'
+      // 时间轴必须**连续**：宿主只返回"有用的桶"，空白日期会缺格，坐标轴上 09-19 后面直接跟
+      // 09-22，两天间隔被压成相邻，看上去像"每天都在用"（用户截图反馈）。这里按区间补齐空格。
+      var buckets = fillBuckets((data && data.buckets) || [], dim, data && data.range)
       var models = (data && data.models) || []
       var conversations = (data && data.conversations) || []
       var health = (data && data.health) || null
@@ -981,7 +1039,6 @@ window.__ModuleLoader__.load({
         cost = { cost: data.totals.cost, peak: { cost: 0, requests: 0, tokens: 0 }, offPeak: { cost: 0, requests: 0, tokens: 0 }, unmatchedModels: [], derived: true }
       }
       var currency = currencyOf(data)
-      var dim = (data && data.dim) || 'hour'
       var hoveredBucket = hovered >= 0 && hovered < buckets.length ? buckets[hovered] : null
 
       var rows = view === 'conversation'
@@ -1422,6 +1479,8 @@ window.__ModuleLoader__.load({
       fmtFull: fmtFull,
       fmtPercent: fmtPercent,
       bucketLabel: bucketLabel,
+      rangeKeys: rangeKeys,
+      fillBuckets: fillBuckets,
       bucketFullLabel: bucketFullLabel,
       fmtAgo: fmtAgo,
       fmtMoney: fmtMoney,

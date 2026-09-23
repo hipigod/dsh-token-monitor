@@ -165,6 +165,7 @@ GET /plugin-api/token-monitor/log?period=…&view=… 日志报告
 | 6 | 窄视口下弹窗有**横向超出风险** | 宽度用 `94vw`，而 Modal 的 `.root` 自带 24px 内边距（可用宽度 = `100vw - 48px`），且卡片是 flex item（`min-width: auto` 不收缩） | 改 `min(1080px, calc(100vw - 48px))` + `min-width: 0`；表格包一层 `overflow-x: auto` 的容器 |
 | **8** | 浮窗**偶尔变成没有皮肤的裸 div**，跑到侧边栏**左上角**压住会话列表（用户 2026-09-16 截图）；**点【日志】打开再关掉就恢复正常** | 皮肤 `<style>` 只写了 `data-plugin-css`、**没写 `data-plugin`**。DSH 的 client-modules 在**每个模块 materialize 时**都会 `claimStyles(id)`，把所有 `style:not([data-plugin])` 认领给那个模块；这张表被别的模块认领后，client-hmr 重建那个模块时会 `removeOwnedStyles(id)` 把它一起删掉。**插件的 fiber 毫发无伤、React 树照常渲染，只是 CSS 没了** → 浮窗落回 `shell.overlay` 的正常流（左上角 0,0）。而重新注入的唯一路径，恰好是打开日志弹窗时 `LogDialog` 顺带跑的那次 `ensureStyle()`——这就是"开关一次日志就好了"的原因 | ① 样式表补上 `data-plugin` = 包名（与官方 `tsdown.client.ts` 的注入器一致，别人 claim 不走）；② `apply()` 里注入皮肤并挂 `MutationObserver(document.head)`，表一消失就补回；③ `position:fixed`/`z-index` 同时走 inline，样式表缺失的那一瞬间也不会掉进正常流；④ `ensureStyle()` 发现这张表**归属被别人改写过**时把归属抢回来（`removeOwnedStyles` 是按 data-plugin 属性比对的，抢回来就等于销掉别人的账），内容被清空也补回。回归：`tests/client.test.mjs`（归属 + 抢回 + 自愈 + 降级 + head 缺失兜底）、`tests/render.test.mjs`（inline 定位）、`tests/e2e-browser.mjs`（真浏览器里删表 → 自动补回、位置不跳）、`scripts/hmr-probe.mjs`（下面「真 HMR 回归」） |
 | **9** | 峰谷时段带在**跨零点后的当天**把 9:00–12:00 的高峰涂成空闲（2026-09-17 00:55 由 e2e 抓到：**峰 0 谷 24**；此前 20:55 跑是绿的，被旧断言放过去了） | `PeakBand` 对**没有用量的小时**（宿主给 `band = 0`，含"今天还没到的小时"）一律回落到 `bandOf(Date.now())` —— 用**当前小时**的颜色涂遍整条带。当前小时是空闲时，一整天的高峰全被涂成"便宜" | 空格子按**它自己那个小时**判定：先解析桶 key（`bandOfKey('2026-09-17T09')`），解析不出再退到「上海今天第 i 个小时」（新增 `shanghaiDayStartMs()`）。旧断言只查「峰谷都有」，改成**金标准向量**：测试与 e2e 都独立算一遍 24 格应有的峰谷，逐格比对，与运行时刻无关 |
+| **10** | 日志弹窗切到**近一周 / 近一月**时只画**有用量记录的那几天**，空白的日期整格消失（用户反馈）：09-19 后面直接跟 09-22，坐标轴上两天的间隔被压成相邻，看上去像"每天都在用" | `timeBuckets()` 用 `Map` 按**记录**建桶（旧注释写着"桶数是有限集合，不逐格遍历"），没有记录的小时/日期根本不产生桶；而客户端的 `Histogram` 是按数组顺序**等距**画柱子的 | ① **宿主**：新增 `bucketKeys(start, end, dim)` 按区间枚举全部 key，`timeBuckets()` 传了 `range` 就先铺空格子再填记录（API 从此返回连续时间轴；`period=all` 跨两万天时按上限保护保持稀疏）；② **客户端**：新增 `rangeKeys()` / `fillBuckets()`，按 `range` 把缺的格子补成 0 桶（`Histogram` 对 0 桶画 2px 底线，等距且能一眼看出空档）。客户端这层让修复**刷新页面即生效、无需重启宿主**；宿主那层等下次自然重启生效，届时客户端补齐退化成幂等。回归：`tests/host.test.mjs`（枚举/空档占位/超长区间保护）、`tests/client.test.mjs`（补齐/乱序/空集/非法区间原样返回）、`tests/e2e-browser.mjs`（真弹窗点【近一周】=7 根、【近一月】=30 根，逐日 key 与金标准比对） |
 
 > 这两个（5、6）是我最初 e2e 只跑 1400×900 一个尺寸漏掉的——**测试视口不等于用户视口**。
 > 现在 `tests/e2e-browser.mjs` 里加了 1280×560 矮视口回归：断言「卡片不越视口 + 内层可滚 + 滚到底最后一段可达」。
@@ -243,11 +244,11 @@ bash /root/apps/dsh-plugin-token-monitor/preflight.sh     # 退出码 0 才允�
 ```bash
 # 从 GitHub 克隆下来后，直接在克隆目录里跑（测试不依赖绝对路径）
 git clone https://github.com/hipigod/dsh-token-monitor.git && cd dsh-token-monitor
-node tests/host.test.mjs          # 51 项：宿主纯逻辑 + 真实 HTTP 路由（自建 server，不依赖宿主）
-node tests/client.test.mjs        # 23 项：格式化/桶标签/峰谷判定/日期/注册契约与皮肤归属契约
+node tests/host.test.mjs          # 55 项：宿主纯逻辑 + 真实 HTTP 路由（自建 server，不依赖宿主）
+node tests/client.test.mjs        # 28 项：格式化/桶标签/时间轴补齐/峰谷判定/日期/注册与皮肤归属契约
 node tests/render.test.mjs        # 27 项：用假 React 直接调用组件函数，断言真实元素树
 TOKEN=$(grep -oE 'token=[A-Za-z0-9_-]+' /var/log/dsh-web.log | tail -1)
-node tests/e2e-browser.mjs "$TOKEN"   # 32 项：无头 Chromium 打开真 GUI，断言真 DOM 几何
+node tests/e2e-browser.mjs "$TOKEN"   # 34 项：无头 Chromium 打开真 GUI，断言真 DOM 几何
 ```
 
 第四层是**唯一能发现其中大多数缺陷**的一层（1、3、5、6、7、8、9 都是它或下面的
